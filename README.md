@@ -34,4 +34,3 @@ Program zapisuje pomijane pakiety w pliku `skip-list.json` obok skryptu. Przy na
 Program stworzony przez **Zalesny123**.
 Kod udostępniany na warunkach licencji **MIT**. Szczegóły w pliku [LICENSE](LICENSE).
 Copyright © 2026 Zalesny123
-=======
