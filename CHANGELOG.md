@@ -3,6 +3,7 @@
 ## [1.0.0] - 2026-05-30
 
 ### Added
+
 - Pierwsza stabilna wersja projektu **WingetUpdater**.
 - Graficzny interfejs użytkownika do sprawdzania i aktualizowania pakietów przez `winget`.
 - Automatyczne sprawdzanie dostępnych aktualizacji po uruchomieniu programu.
@@ -19,6 +20,7 @@
 - Inne funkcje, wyżej niewymienione a obecne w GUI programu.
 
 ### Notes
+
 - Program wymusza uruchamianie przez `Start.bat`, aby ograniczyć przypadkowe uruchomienie głównego skryptu poza przewidzianym trybem.
 - Launcher pokazuje treść licencji przed pierwszym uruchomieniem i zapisuje lokalny znacznik akceptacji.
 - Kontekst diagnostyczny dla agenta AI zakłada bezpieczny research i brak zmian bez wyraźnego potwierdzenia użytkownika.
