@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     WingetUpdater - Narzędzie ułatwiające aktualizację pakietów za pomocą winget.
@@ -9,6 +9,9 @@
 #>
 # Dziala w Windows PowerShell 5.1 oraz PowerShell 7+ na Windows.
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '', Justification = 'Private WinForms event helpers use application-oriented names.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'This script is an interactive GUI; confirmation is handled by dialogs and winget/UAC.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Private helpers intentionally use collection-oriented names.')]
 param (
     [string]$LauncherSecret = ''
 )
@@ -81,7 +84,8 @@ $Script:Grid = $null
 $Script:LogBox = $null
 $Script:Form = $null
 $Script:TestModeCheck = $null
-$Script:MockFile = Join-Path $Script:AppDir 'MockState.json'
+$Script:TestDir = Join-Path $Script:AppDir 'Tests'
+$Script:MockFile = Join-Path $Script:TestDir 'MockState.json'
 
 function Reset-MockState {
     $data = [ordered]@{
@@ -91,6 +95,9 @@ function Reset-MockState {
         'Test.OperaLike' = @{ Name = 'Aplikacja Opera-podobna'; Current = '1.0'; Available = '2.0'; Scope = 'Machine'; ExitCode = -1978335212; AdminExitCode = -1978335212; Ghost = $false }
         'Test.Uparty' = @{ Name = 'Aplikacja Uparta (Ghost)'; Current = '1.0'; Available = '2.0'; Scope = 'Machine'; ExitCode = 0; AdminExitCode = 0; Ghost = $true }
         'Test.UnknownVer' = @{ Name = 'Aplikacja Unknown'; Current = 'Unknown'; Available = '2.0'; Scope = 'User'; ExitCode = 0; AdminExitCode = 0; Ghost = $false }
+    }
+    if (-not (Test-Path -LiteralPath $Script:TestDir)) {
+        [void](New-Item -ItemType Directory -Path $Script:TestDir -Force)
     }
     $data | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Script:MockFile -Encoding UTF8
 }
@@ -106,7 +113,7 @@ function New-PackagesTable {
     [void]$table.Columns.Add('IssueType', [string])
     [void]$table.Columns.Add('Source', [string])
     [void]$table.Columns.Add('Status', [string])
-    Write-Output -NoEnumerate $table
+    return ,$table
 }
 
 $Script:Packages = New-PackagesTable
@@ -678,15 +685,30 @@ function Invoke-Winget {
 
     # --- POCZĄTEK: PRZECHWYCENIE WINGET DLA TRYBU TESTOWEGO ---
     if ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked) {
-        if (-not (Test-Path $Script:MockFile)) { Reset-MockState }
+        if (-not (Test-Path -LiteralPath $Script:MockFile)) { Reset-MockState }
         if ($Arguments -contains '--version') { return [pscustomobject]@{ Output = "v1.9.0-mock"; ExitCode = 0 } }
         if ($Arguments -contains '--help') { return [pscustomobject]@{ Output = "--include-unknown --exact --accept-package-agreements --accept-source-agreements --disable-interactivity --silent --source"; ExitCode = 0 } }
         if ($Arguments -contains 'source' -and $Arguments -contains 'update') { return [pscustomobject]@{ Output = "Source updated"; ExitCode = 0 } }
-        
-        $mock = Get-Content $Script:MockFile | ConvertFrom-Json
-        
+
+        $mock = Get-Content -LiteralPath $Script:MockFile -Raw | ConvertFrom-Json
+
+        if ($Arguments -contains 'show' -and $Arguments -contains '--id') {
+            $idIdx = [array]::IndexOf($Arguments, '--id') + 1
+            if ($idIdx -le 0 -or $idIdx -ge $Arguments.Count) {
+                return [pscustomobject]@{ Output = "Missing mock package id"; ExitCode = 1 }
+            }
+
+            $id = $Arguments[$idIdx]
+            $pkg = $mock.$id
+            if ($null -eq $pkg) {
+                return [pscustomobject]@{ Output = "Mock package not found: $id"; ExitCode = 1 }
+            }
+
+            return [pscustomobject]@{ Output = "Installer Scope: $($pkg.Scope)"; ExitCode = 0 }
+        }
+
         # Symulacja wyszukiwania aktualizacji
-        if ($Arguments -contains 'upgrade' -and $Arguments -notmatch '--id') {
+        if ($Arguments -contains 'upgrade' -and $Arguments -notcontains '--id') {
             $out = "Name Id Version Available Source`n"
             $out += "---- -- ------- --------- ------`n"
             foreach ($key in $mock.PSObject.Properties.Name) {
@@ -698,13 +720,16 @@ function Invoke-Winget {
             if ($LiveLog) { Start-Sleep -Milliseconds 500 }
             return [pscustomobject]@{ Output = $out; ExitCode = 0 }
         }
-        
+
         # Symulacja instalacji User
         if ($Arguments -contains 'upgrade' -and $Arguments -contains '--id') {
             $idIdx = [array]::IndexOf($Arguments, '--id') + 1
             $id = $Arguments[$idIdx]
             $pkg = $mock.$id
-            
+            if ($null -eq $pkg) {
+                return [pscustomobject]@{ Output = "Mock package not found: $id"; ExitCode = 1 }
+            }
+
             if ($LiveLog) {
                 Update-LogLiveLine -Spinner "-"
                 Start-Sleep -Milliseconds 300
@@ -712,7 +737,7 @@ function Invoke-Winget {
                 Start-Sleep -Milliseconds 300
                 Update-LogLiveLine -Progress "100%"
             }
-            
+
             if ($pkg.ExitCode -ne 0) { return [pscustomobject]@{ Output = "Error"; ExitCode = $pkg.ExitCode } }
             if (-not $pkg.Ghost) {
                 $pkg.Current = $pkg.Available
@@ -857,7 +882,7 @@ function Invoke-Winget {
             $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         }
         catch {
-            # Older runtimes can ignore explicit stream encoding.
+            Write-Verbose "Runtime ignored explicit stream encoding: $($_.Exception.Message)"
         }
 
         $process = New-Object System.Diagnostics.Process
@@ -946,8 +971,9 @@ function Invoke-Winget {
 }
 
 function Initialize-WingetInfo {
+    $usingMock = ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked)
     $command = Get-Command winget -ErrorAction SilentlyContinue
-    if ($null -eq $command) {
+    if ($null -eq $command -and -not $usingMock) {
         throw 'Nie znaleziono winget w PATH.'
     }
 
@@ -973,9 +999,10 @@ function Initialize-WingetInfo {
     }
 
     $supportsIncludeUnknown = (Test-WingetHelpOption -HelpText $helpText -Option '--include-unknown') -or (Test-WingetHelpOption -HelpText $helpText -Option '--unknown')
+    $wingetPath = if ($usingMock) { 'mock-winget' } else { [string]$command.Source }
 
     $Script:WingetInfo = [pscustomobject]@{
-        Path = [string]$command.Source
+        Path = $wingetPath
         VersionText = $versionText
         Version = $version
         SupportsAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
@@ -1032,7 +1059,7 @@ function New-WingetPackageUpgradeArguments {
     if (-not [string]::IsNullOrWhiteSpace($Source) -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsSource)) {
         $arguments += @('--source', $Source)
     }
-    
+
     if ($null -ne $Script:InteractiveCheck -and $Script:InteractiveCheck.Checked -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsInteractive)) {
         $arguments += '--interactive'
     }
@@ -1060,15 +1087,23 @@ function Add-PackageRow {
     Set-RowValue -Row $row -ColumnName 'Id' -Value $Package.Id
     Set-RowValue -Row $row -ColumnName 'CurrentVersion' -Value $Package.CurrentVersion
     Set-RowValue -Row $row -ColumnName 'AvailableVersion' -Value $Package.AvailableVersion
-    
+
     $issue = Get-PackageIssueType -Package $Package
     if ($isGhost) {
         $issue = 'Aplikacja samoaktualizujaca'
     }
     Set-RowValue -Row $row -ColumnName 'IssueType' -Value $issue
     Set-RowValue -Row $row -ColumnName 'Source' -Value $Package.Source
-    Set-RowValue -Row $row -ColumnName 'Status' -Value $(if ($isSkipped) { 'Pominiete' } elseif ($isGhost) { 'Blad (Ghost)' } else { '' })
-    
+
+    $status = ''
+    if ($isSkipped) {
+        $status = 'Pominiete'
+    }
+    elseif ($isGhost) {
+        $status = 'Blad (Ghost)'
+    }
+    Set-RowValue -Row $row -ColumnName 'Status' -Value $status
+
     [void]$Script:Packages.Rows.Add($row)
 }
 
@@ -1313,13 +1348,18 @@ function Refresh-Packages {
             Add-PackageRow -Package $package
         }
 
-        # Apply visual lock for Ghost Updates in the grid
         if ($null -ne $Script:Grid) {
             foreach ($gridRow in $Script:Grid.Rows) {
-                $status = [string]$gridRow.Cells['Status'].Value
-                if ($status -eq 'Blad (Ghost)') {
-                    $gridRow.Cells['Update'].ReadOnly = $true
-                    $gridRow.Cells['Update'].Style.BackColor = [System.Drawing.Color]::LightGray
+                $isGhostRow = Test-IsGhostPackageRow -Row $gridRow
+                $gridRow.Cells['Update'].ReadOnly = $isGhostRow
+                $gridRow.Cells['Update'].Style.BackColor = if ($isGhostRow) {
+                    [System.Drawing.Color]::LightGray
+                }
+                else {
+                    [System.Drawing.Color]::Empty
+                }
+                if ($isGhostRow) {
+                    $gridRow.Cells['Update'].Value = $false
                 }
             }
         }
@@ -1356,6 +1396,18 @@ function Refresh-Packages {
     }
 }
 
+function Test-IsGhostPackageRow {
+    param([object]$Row)
+
+    if ($null -eq $Row) {
+        return $false
+    }
+
+    $issue = [string](Get-RowValue -Row $Row -ColumnName 'IssueType')
+    $status = [string](Get-RowValue -Row $Row -ColumnName 'Status')
+    return ($issue -eq 'Aplikacja samoaktualizujaca' -or $status -eq 'Blad (Ghost)')
+}
+
 function Get-SelectedUpdateRows {
     Commit-GridEdits
 
@@ -1365,11 +1417,17 @@ function Get-SelectedUpdateRows {
             continue
         }
 
+        if ((Test-IsGhostPackageRow -Row $row) -and [bool](Get-RowValue -Row $row -ColumnName 'Update')) {
+            Set-RowValue -Row $row -ColumnName 'Update' -Value $false
+            Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
+            continue
+        }
+
         if ([bool](Get-RowValue -Row $row -ColumnName 'Update') -and -not [bool](Get-RowValue -Row $row -ColumnName 'Skip')) {
             [void]$rows.Add($row)
         }
     }
-    Write-Output -NoEnumerate $rows
+    return ,$rows
 }
 
 function Set-AllPackageSelection {
@@ -1387,6 +1445,13 @@ function Set-AllPackageSelection {
         }
 
         if ($ColumnName -eq 'Update') {
+            if (Test-IsGhostPackageRow -Row $row) {
+                Set-RowValue -Row $row -ColumnName 'Update' -Value $false
+                if (-not [bool](Get-RowValue -Row $row -ColumnName 'Skip')) {
+                    Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
+                }
+                continue
+            }
             if ($Checked -and [bool](Get-RowValue -Row $row -ColumnName 'Skip')) {
                 continue
             }
@@ -1397,6 +1462,10 @@ function Set-AllPackageSelection {
             if ($Checked) {
                 Set-RowValue -Row $row -ColumnName 'Update' -Value $false
                 Set-RowValue -Row $row -ColumnName 'Status' -Value 'Pominiete'
+            }
+            elseif (Test-IsGhostPackageRow -Row $row) {
+                Set-RowValue -Row $row -ColumnName 'Update' -Value $false
+                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
             }
             elseif ([string](Get-RowValue -Row $row -ColumnName 'Status') -eq 'Pominiete') {
                 Set-RowValue -Row $row -ColumnName 'Status' -Value ''
@@ -1429,6 +1498,10 @@ function Apply-SkipListToVisiblePackages {
             Set-RowValue -Row $row -ColumnName 'Update' -Value $false
             Set-RowValue -Row $row -ColumnName 'Status' -Value 'Pominiete'
             $matched++
+        }
+        elseif (Test-IsGhostPackageRow -Row $row) {
+            Set-RowValue -Row $row -ColumnName 'Update' -Value $false
+            Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
         }
         elseif ([string](Get-RowValue -Row $row -ColumnName 'Status') -eq 'Pominiete') {
             Set-RowValue -Row $row -ColumnName 'Status' -Value ''
@@ -1580,9 +1653,13 @@ function Invoke-WingetElevated {
         if ($Arguments -contains 'upgrade' -and $Arguments -contains '--id') {
             $idIdx = [array]::IndexOf($Arguments, '--id') + 1
             $id = $Arguments[$idIdx]
-            
-            $mock = Get-Content $Script:MockFile | ConvertFrom-Json
+
+            $mock = Get-Content -LiteralPath $Script:MockFile -Raw | ConvertFrom-Json
             $pkg = $mock.$id
+            if ($null -eq $pkg) {
+                Append-Log "[MOCK UAC] Nie znaleziono pakietu: $id"
+                return 1
+            }
 
             Append-Log "[MOCK UAC] Proba aktualizacji $id z uprawnieniami..."
             Start-Spinner
@@ -1593,10 +1670,10 @@ function Invoke-WingetElevated {
                 [System.Windows.Forms.Application]::DoEvents()
             }
             Stop-Spinner
-            
-            if ($pkg.AdminExitCode -ne 0) { 
+
+            if ($pkg.AdminExitCode -ne 0) {
                 Append-Log "[MOCK UAC] Odmowa instalatora (zwrocono blad $($pkg.AdminExitCode))."
-                return $pkg.AdminExitCode 
+                return $pkg.AdminExitCode
             }
             if (-not $pkg.Ghost) {
                 $pkg.Current = $pkg.Available
@@ -1609,11 +1686,11 @@ function Invoke-WingetElevated {
     # --- KONIEC: PRZECHWYCENIE WINGET ELEVATED DLA TRYBU TESTOWEGO ---
 
     $tempLog = Join-Path $env:TEMP "WingetElevated_$([guid]::NewGuid().ToString().Substring(0,8)).log"
-    
+
     # Przekazanie złączonych argumentów. Argumenty zawierają apostrofy/cudzysłowy,
     # więc bezpieczniej przekazać je przez Base64.
     $argsJoined = $Arguments -join ' '
-    
+
     $scriptBlock = @"
 `$psi = New-Object System.Diagnostics.ProcessStartInfo
 `$psi.FileName = 'winget'
@@ -1655,7 +1732,7 @@ if (`$buffer.Length -gt 0) {
 `$writer.WriteLine("[E]" + `$proc.ExitCode)
 `$writer.Close()
 "@
-    
+
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($scriptBlock))
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1673,7 +1750,7 @@ if (`$buffer.Length -gt 0) {
         $lastPos = 0
         $chunkBuffer = ""
         $keepReading = $true
-        
+
         while ($keepReading) {
             $hasData = $false
             if (Test-Path $tempLog) {
@@ -1689,12 +1766,12 @@ if (`$buffer.Length -gt 0) {
                         $hasData = $true
                     }
                     $fs.Close()
-                    
+
                     if ($hasData) {
                         while ($chunkBuffer -match "(?s)^(.*?)\r?\n(.*)$") {
                             $line = $matches[1]
                             $chunkBuffer = $matches[2]
-                            
+
                             if ($line.StartsWith('[T]')) {
                                 $content = (ConvertTo-PlainText $line.Substring(3)).Trim()
                                 if (Test-IsWingetSpinnerLine -Line $content) {
@@ -1713,9 +1790,12 @@ if (`$buffer.Length -gt 0) {
                             }
                         }
                     }
-                } catch { }
+                }
+                catch {
+                    Write-Verbose "Temporary elevated log read failed: $($_.Exception.Message)"
+                }
             }
-            
+
             if ($keepReading) {
                 if ($process.HasExited -and -not $hasData) {
                     $keepReading = $false
@@ -1733,7 +1813,12 @@ if (`$buffer.Length -gt 0) {
     }
     finally {
         Stop-Spinner
-        try { Remove-Item -Path $tempLog -Force -ErrorAction SilentlyContinue } catch { }
+        try {
+            Remove-Item -Path $tempLog -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            Write-Verbose "Temporary elevated log cleanup failed: $($_.Exception.Message)"
+        }
     }
     return $exitCode
 }
@@ -1778,7 +1863,7 @@ function Update-SelectedPackages {
             $id = [string](Get-RowValue -Row $row -ColumnName 'Id')
             $source = ([string](Get-RowValue -Row $row -ColumnName 'Source')).Trim()
             $scope = Get-WingetPackageScope -Id $id -Source $source
-            
+
             if ($scope -eq 'User') {
                 $userScopedRows += $row
                 Append-Log "Pakiet [USER]: $id (Nie wymaga uprawnien Administratora)"
@@ -1819,7 +1904,7 @@ function Update-SelectedPackages {
             Append-Log "Aktualizacja administracyjna (Machine-Scoped): $($machineScopedRows.Count)"
             Append-Log 'Wyswietlam powiadomienie UAC (Zaakceptuj)...'
             Append-Log '========================================'
-            
+
             foreach ($row in $machineScopedRows) {
                 $id = [string](Get-RowValue -Row $row -ColumnName 'Id')
                 $source = ([string](Get-RowValue -Row $row -ColumnName 'Source')).Trim()
@@ -1828,9 +1913,9 @@ function Update-SelectedPackages {
 
                 $arguments = @(New-WingetPackageUpgradeArguments -Id $id -Source $source)
                 Append-Log "> [ADMIN] winget $($arguments -join ' ')"
-                
+
                 $exitCode = Invoke-WingetElevated -Arguments $arguments
-                
+
                 if ($exitCode -eq 0) {
                     Set-RowValue -Row $row -ColumnName 'Status' -Value 'Zakonczono'
                     $Script:AttemptedUpdates[$id] = [string](Get-RowValue -Row $row -ColumnName 'AvailableVersion')
@@ -1869,7 +1954,7 @@ function Get-UnknownPackageRows {
         }
     }
 
-    Write-Output -NoEnumerate $rows
+    return ,$rows
 }
 
 function ConvertTo-CellText {
@@ -2184,8 +2269,9 @@ Load-SkipList
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 [System.Windows.Forms.Application]::add_ThreadException({
-    param($sender, $eventArgs)
-    Show-AppError -ErrorRecord $eventArgs.Exception -Title 'Blad aplikacji'
+    param($threadSender, $threadEventArgs)
+    $null = $threadSender
+    Show-AppError -ErrorRecord $threadEventArgs.Exception -Title 'Blad aplikacji'
 })
 
 $Script:ToolTip = New-Object System.Windows.Forms.ToolTip
@@ -2438,27 +2524,37 @@ $Script:Grid.Add_CurrentCellDirtyStateChanged({
 })
 
 $Script:Grid.Add_CellValueChanged({
-    param($sender, $eventArgs)
+    param($gridSender, $cellEventArgs)
+    $null = $gridSender
 
-    if ($eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -lt 0) {
+    if ($cellEventArgs.RowIndex -lt 0 -or $cellEventArgs.ColumnIndex -lt 0) {
         return
     }
 
-    $columnName = $Script:Grid.Columns[$eventArgs.ColumnIndex].Name
-    $row = $Script:Grid.Rows[$eventArgs.RowIndex]
+    $columnName = $Script:Grid.Columns[$cellEventArgs.ColumnIndex].Name
+    $row = $Script:Grid.Rows[$cellEventArgs.RowIndex]
 
     if ($columnName -eq 'Skip' -and [bool]($row.Cells['Skip'].Value)) {
         $row.Cells['Update'].Value = $false
         $row.Cells['Status'].Value = 'Pominiete'
     }
     elseif ($columnName -eq 'Update' -and [bool]($row.Cells['Update'].Value)) {
+        if (Test-IsGhostPackageRow -Row $row) {
+            $row.Cells['Update'].Value = $false
+            $row.Cells['Status'].Value = 'Blad (Ghost)'
+            return
+        }
         $row.Cells['Skip'].Value = $false
         if ([string]($row.Cells['Status'].Value) -eq 'Pominiete') {
             $row.Cells['Status'].Value = ''
         }
     }
     elseif ($columnName -eq 'Skip' -and -not [bool]($row.Cells['Skip'].Value)) {
-        if ([string]($row.Cells['Status'].Value) -eq 'Pominiete') {
+        if (Test-IsGhostPackageRow -Row $row) {
+            $row.Cells['Update'].Value = $false
+            $row.Cells['Status'].Value = 'Blad (Ghost)'
+        }
+        elseif ([string]($row.Cells['Status'].Value) -eq 'Pominiete') {
             $row.Cells['Status'].Value = ''
         }
     }
@@ -2507,7 +2603,7 @@ $Script:Form.Add_FormClosing({
         Save-SkipList -Silent
     }
     catch {
-        # Closing should not be blocked by a save error.
+        Write-Verbose "Closing skip-list save failed: $($_.Exception.Message)"
     }
 })
 
