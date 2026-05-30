@@ -4,25 +4,25 @@
 
 ### Added
 
-- Pierwsza stabilna wersja projektu **WingetUpdater**.
-- Graficzny interfejs użytkownika do sprawdzania i aktualizowania pakietów przez `winget`.
-- Automatyczne sprawdzanie dostępnych aktualizacji po uruchomieniu programu.
-- Obsługa pakietów z nieznaną wersją przez opcję `--include-unknown`.
-- Możliwość wybierania konkretnych pakietów do aktualizacji.
-- Możliwość pomijania wybranych pakietów.
-- Trwała lista pomijanych pakietów zapisywana w pliku `skip-list.json`.
-- Launcher `Start.bat` jako jedyny zalecany sposób uruchamiania programu.
-- Automatyczne wykrywanie dostępnego środowiska uruchomieniowego: CMD, Windows PowerShell 5.1 lub PowerShell 7+.
-- Obsługa uruchamiania programu z uprawnieniami administratora.
-- Obsługa trybu naprawy pakietów z nieznaną wersją przez funkcję „Napraw Unknown”.
-- Generowanie kontekstu diagnostycznego dla agenta AI przy naprawie pakietów Unknown.
-- Obsługa licencji MIT.
-- Inne funkcje, wyżej niewymienione a obecne w GUI programu.
+- First stable release of the **WingetUpdater** project.
+- Graphical user interface for checking and updating packages through `winget`.
+- Automatic check for available updates when the program starts.
+- Support for packages with an unknown version through the `--include-unknown` option.
+- Ability to select specific packages for update.
+- Ability to skip selected packages.
+- Persistent skipped-package list saved in the `skip-list.json` file.
+- `Start.bat` launcher as the only recommended way to start the program.
+- Automatic detection of the available runtime environment: CMD, Windows PowerShell 5.1, or PowerShell 7+.
+- Support for running the program with administrator privileges.
+- Support for repairing packages with an unknown version through the "Repair Unknown" feature.
+- Generation of diagnostic context for an AI agent when repairing Unknown packages.
+- MIT license support.
+- Other features not listed above that are present in the program GUI.
 
 ### Notes
 
-- Program wymusza uruchamianie przez `Start.bat`, aby ograniczyć przypadkowe uruchomienie głównego skryptu poza przewidzianym trybem.
-- Launcher pokazuje treść licencji przed pierwszym uruchomieniem i zapisuje lokalny znacznik akceptacji.
-- Kontekst diagnostyczny dla agenta AI zakłada bezpieczny research i brak zmian bez wyraźnego potwierdzenia użytkownika.
-- Program jest przeznaczony dla systemu Windows.
-- Program wymaga zainstalowanego Windows Package Managera (`winget`).
+- The program enforces startup through `Start.bat` to reduce accidental execution of the main script outside the intended mode.
+- The launcher displays the license text before the first run and saves a local acceptance marker.
+- The diagnostic context for the AI agent assumes safe research and no changes without explicit user confirmation.
+- The program is intended for Windows.
+- The program requires Windows Package Manager (`winget`) to be installed.
