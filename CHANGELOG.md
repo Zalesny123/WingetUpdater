@@ -11,18 +11,23 @@
 - Ability to select specific packages for update.
 - Ability to skip selected packages.
 - Persistent skipped-package list saved in the `skip-list.json` file.
-- `Start.bat` launcher as the only recommended way to start the program.
+- `Start.bat` launcher as the intended way to start the program.
 - Automatic detection of the available runtime environment: CMD, Windows PowerShell 5.1, or PowerShell 7+.
-- Support for running the program with administrator privileges.
-- Support for repairing packages with an unknown version through the "Repair Unknown" feature.
+- Support for elevated operations when required by package updates.
+- Support for refreshing the winget source database before checking for updates.
+- Support for silent mode and interactive installer mode where supported by `winget`.
+- Support for repairing packages with an unknown version through the **Repair Unknown** feature.
 - Generation of diagnostic context for an AI agent when repairing Unknown packages.
 - MIT license support.
-- Other features not listed above that are present in the program GUI.
 
-### Notes
+### Requirements
 
-- The program enforces startup through `Start.bat` to reduce accidental execution of the main script outside the intended mode.
+- Windows.
+- Windows Package Manager (`winget`).
+- Windows PowerShell 5.1 or PowerShell 7+.
+
+### Safety notes
+
+- The program should be started through `Start.bat`.
 - The launcher displays the license text before the first run and saves a local acceptance marker.
-- The diagnostic context for the AI agent assumes safe research and no changes without explicit user confirmation.
-- The program is intended for Windows.
-- The program requires Windows Package Manager (`winget`) to be installed.
+- The diagnostic context for the AI agent is designed for safe research and does not assume changes without explicit user confirmation.
