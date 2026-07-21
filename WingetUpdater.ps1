@@ -52,7 +52,6 @@ $Script:ToolTip = $null
 $Script:Form = $null
 $Script:ClosePending = $false
 $Script:CancellationState = New-WingetUpdaterCancellationState
-$Script:CurrentWingetProcess = $null
 $Script:SourceAgreementsAccepted = $false
 
 function Dispose-WingetUpdaterResource {
@@ -91,7 +90,6 @@ try {
     $Script:StartupWarnings = @($Script:StorageInitialization.Warnings)
     $Script:SourceAgreementsAccepted = [bool]$Script:StorageInitialization.SourceAgreementsAccepted
     $Script:SkipFile = $Script:Paths.SkipListFile
-    $Script:RepairDir = $Script:Paths.RepairContextsDirectory
     $Script:SkippedIds = @{}
     $Script:AttemptedUpdates = @{}
     $Script:UnresolvedFailures = New-WingetUpdaterSessionFailureRegistry
@@ -140,6 +138,7 @@ function Reset-MockState {
         'Test.SecondOK' = @{ Name = 'Aplikacja Druga'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $false }
         'Test.SpotifyLike' = @{ Name = 'Aplikacja Spotify-podobna'; Current = '1.0'; Available = '2.0'; ExitCode = -1978335146; Ghost = $false }
         'Test.OperaLike' = @{ Name = 'Aplikacja Opera-podobna'; Current = '1.0'; Available = '2.0'; ExitCode = -1978335212; Ghost = $false }
+        'Test.RetrySuccess' = @{ Name = 'Aplikacja Udana po bledach'; Current = '1.0'; Available = '2.0'; ExitCodes = @(71, 72, 0); Attempt = 0; Ghost = $false }
         'Test.Uparty' = @{ Name = 'Aplikacja Uparta (Ghost)'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $true }
         'Test.UnknownVer' = @{ Name = 'Aplikacja Unknown'; Current = 'Unknown'; Available = '2.0'; ExitCode = 0; Ghost = $false }
     }
@@ -702,21 +701,44 @@ function Invoke-Winget {
                 }
             }
 
-            if ($delayCompleted -and $null -ne $pkg -and $pkg.ExitCode -ne 0) {
-                $standardError = 'Error'
-                $exitCode = [int]$pkg.ExitCode
-            }
-            elseif ($delayCompleted -and $null -ne $pkg -and -not $pkg.Ghost) {
-                if (-not (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)) {
+            if ($delayCompleted -and $null -ne $pkg -and -not (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)) {
+                $hasExitSequence = $null -ne $pkg.PSObject.Properties['ExitCodes']
+                $scenarioExitCode = 0
+                $nextAttempt = $null
+                if ($hasExitSequence) {
+                    $exitCodes = @($pkg.ExitCodes)
+                    if ($exitCodes.Count -eq 0) {
+                        throw "Mock package $id has an empty ExitCodes sequence."
+                    }
+                    $attempt = if ($null -ne $pkg.PSObject.Properties['Attempt']) { [int]$pkg.Attempt } else { 0 }
+                    $scenarioIndex = [Math]::Min($attempt, $exitCodes.Count - 1)
+                    $scenarioExitCode = [int]$exitCodes[$scenarioIndex]
+                    $nextAttempt = $attempt + 1
+                }
+                elseif ($null -ne $pkg.PSObject.Properties['ExitCode']) {
+                    $scenarioExitCode = [int]$pkg.ExitCode
+                }
+
+                if ($null -ne $nextAttempt) {
+                    $pkg.Attempt = $nextAttempt
+                }
+                if ($scenarioExitCode -ne 0) {
+                    $standardError = 'Error'
+                    $exitCode = $scenarioExitCode
+                }
+                elseif (-not [bool]$pkg.Ghost) {
                     $pkg.Current = $pkg.Available
+                    $standardOutput = 'Success'
+                }
+                else {
+                    $standardOutput = 'Success'
+                }
+
+                if ($hasExitSequence -or $scenarioExitCode -eq 0) {
                     if (-not (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)) {
                         Write-WingetUpdaterJson -Path $Script:MockFile -Data $mock
-                        $standardOutput = 'Success'
                     }
                 }
-            }
-            elseif ($delayCompleted -and $null -ne $pkg) {
-                $standardOutput = 'Success'
             }
         }
 
@@ -775,7 +797,6 @@ function Invoke-Winget {
     }
 
     try {
-        $Script:CurrentWingetProcess = $true
         $result = Invoke-WingetProcess -ApplicationPath $ApplicationPath -Arguments $Arguments -LogsDirectory $Script:Paths.LogsDirectory -Package $Package -OnOutput $displayCallback -OnPulse $pulseCallback -CancellationState $Script:CancellationState
         Assert-WingetCleanupGuaranteed -Result $result
         if ($LiveLog) {
@@ -784,7 +805,6 @@ function Invoke-Winget {
         return $result
     }
     finally {
-        $Script:CurrentWingetProcess = $null
         if ($LiveLog) {
             Stop-Spinner
         }
@@ -836,7 +856,6 @@ function Initialize-WingetInfo {
         VersionText = $versionText
         Version = $version
         SupportsAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
-        SupportsSourceUpdateAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
         SupportsAcceptPackageAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-package-agreements'
         SupportsDisableInteractivity = Test-WingetHelpOption -HelpText $helpText -Option '--disable-interactivity'
         SupportsIncludeUnknown = $supportsIncludeUnknown
@@ -870,11 +889,24 @@ function Add-PackageRow {
     $isSkipped = $Script:SkippedIds.ContainsKey($Package.Id)
     $attemptKey = Get-PackageAttemptKey -Id $Package.Id -Source $Package.Source
     $isGhost = $Script:AttemptedUpdates.ContainsKey($attemptKey) -and $Script:AttemptedUpdates[$attemptKey] -eq $Package.AvailableVersion
+    $existingFailure = Get-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Id $Package.Id -Source $Package.Source
 
     if ($isGhost) {
-        $storedResult = if ($Script:SuccessfulAttemptResults.ContainsKey($attemptKey)) { $Script:SuccessfulAttemptResults[$attemptKey] } else { $null }
-        Add-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Package $Package -Result $storedResult -FailureType 'PostVerificationFailure'
+        $storedAttempt = if ($Script:SuccessfulAttemptResults.ContainsKey($attemptKey)) { $Script:SuccessfulAttemptResults[$attemptKey] } else { $null }
+        $storedResult = if ($null -ne $storedAttempt -and $storedAttempt.PSObject.Properties['Result']) { $storedAttempt.Result } else { $storedAttempt }
+        $attemptCount = if ($null -ne $storedAttempt -and $storedAttempt.PSObject.Properties['AttemptCount']) {
+            [int]$storedAttempt.AttemptCount
+        }
+        elseif ($null -ne $existingFailure) {
+            [int]$existingFailure.AttemptCount
+        }
+        else {
+            1
+        }
+        Add-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Package $Package -Result $storedResult -FailureType 'PostVerificationFailure' -AttemptCountOverride $attemptCount
+        $existingFailure = Get-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Id $Package.Id -Source $Package.Source
     }
+    $hasOrdinaryFailure = $null -ne $existingFailure -and [string]$existingFailure.FailureType -eq 'PackageUpgradeFailure'
 
     $row = $Table.NewRow()
     Set-RowValue -Row $row -ColumnName 'Update' -Value (-not $isSkipped -and -not $isGhost)
@@ -888,15 +920,21 @@ function Add-PackageRow {
     if ($isGhost) {
         $issue = 'Aplikacja samoaktualizujaca'
     }
+    elseif ($hasOrdinaryFailure) {
+        $issue = 'Blad aktualizacji'
+    }
     Set-RowValue -Row $row -ColumnName 'IssueType' -Value $issue
     Set-RowValue -Row $row -ColumnName 'Source' -Value $Package.Source
 
     $status = ''
-    if ($isSkipped) {
-        $status = 'Pominiete'
-    }
-    elseif ($isGhost) {
+    if ($isGhost) {
         $status = 'Blad (Ghost)'
+    }
+    elseif ($hasOrdinaryFailure) {
+        $status = if ($null -eq $existingFailure.ExitCode) { 'Blad aktualizacji' } else { "Blad: $($existingFailure.ExitCode)" }
+    }
+    elseif ($isSkipped) {
+        $status = 'Pominiete'
     }
     Set-RowValue -Row $row -ColumnName 'Status' -Value $status
 
@@ -1115,6 +1153,8 @@ function Test-OperationEntryAllowed {
 }
 
 function Confirm-SourceAgreements {
+    param([scriptblock]$PromptAction)
+
     if ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked) {
         return $true
     }
@@ -1122,20 +1162,21 @@ function Confirm-SourceAgreements {
         return $true
     }
 
-    $promptAction = {
-        $message = "Pelny dostep do winget wymaga zgody na umowy metadanych zrodel.`r`n`r`nOpcja --accept-source-agreements pozwala zaakceptowac te umowy przed pobraniem metadanych.`r`n`r`nOdmowa pozostawi GUI otwarte, z dostepnym trybem Mock. Pelny dostep wymaga ponownego uzycia Odswiez."
-        $choice = [System.Windows.Forms.MessageBox]::Show(
-            $message,
-            'Zgoda na umowy zrodel',
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Warning
-        )
-        return ($choice -eq [System.Windows.Forms.DialogResult]::Yes)
-    }.GetNewClosure()
+    if ($null -eq $PromptAction) {
+        $PromptAction = {
+            $message = "Pelny dostep do winget wymaga zgody na umowy metadanych zrodel.`r`n`r`nOpcja --accept-source-agreements pozwala zaakceptowac te umowy przed pobraniem metadanych.`r`n`r`nOdmowa pozostawi GUI otwarte, z dostepnym trybem Mock. Pelny dostep wymaga ponownego uzycia Odswiez."
+            $choice = [System.Windows.Forms.MessageBox]::Show(
+                $message,
+                'Zgoda na umowy zrodel',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return ($choice -eq [System.Windows.Forms.DialogResult]::Yes)
+        }
+    }
     $settingsFile = $Script:Paths.SettingsFile
     $persistAction = {
         Grant-WingetUpdaterSourceAgreements -Path $settingsFile | Out-Null
-        $Script:SourceAgreementsAccepted = $true
     }.GetNewClosure()
     $decision = Resolve-WingetUpdaterSourceAgreementConsent `
         -MockMode $false `
@@ -1148,6 +1189,7 @@ function Confirm-SourceAgreements {
         }
         return $false
     }
+    $Script:SourceAgreementsAccepted = [bool]$decision.Accepted
     return $true
 }
 
@@ -1180,7 +1222,7 @@ function Complete-Operation {
 function Invoke-WingetSourceUpdate {
     param([switch]$ContinueOnError)
 
-    $arguments = @(New-WingetSourceUpdateArguments -Capabilities $Script:WingetInfo -SourceAgreementsAccepted $Script:SourceAgreementsAccepted)
+    $arguments = @(New-WingetSourceUpdateArguments)
     $result = Invoke-Winget -Arguments $arguments -LiveLog
 
     if ($result.Cancelled) {
@@ -1648,12 +1690,20 @@ function Update-SelectedPackages {
             elseif ($result.ExitCode -eq 0) {
                 Set-RowValue -Row $row -ColumnName 'Status' -Value 'OK'
                 $attemptKey = Get-PackageAttemptKey -Id $id -Source $source
+                $previousFailure = Get-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Id $id -Source $source
+                $attemptCount = if ($null -ne $previousFailure) { [int]$previousFailure.AttemptCount + 1 } else { 1 }
                 $Script:AttemptedUpdates[$attemptKey] = [string](Get-RowValue -Row $row -ColumnName 'AvailableVersion')
-                $Script:SuccessfulAttemptResults[$attemptKey] = $result
+                $Script:SuccessfulAttemptResults[$attemptKey] = [pscustomobject]@{
+                    Result = $result
+                    AttemptCount = $attemptCount
+                }
                 Remove-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Id $id -Source $source
             }
             else {
                 Set-RowValue -Row $row -ColumnName 'Status' -Value "Blad: $($result.ExitCode)"
+                $attemptKey = Get-PackageAttemptKey -Id $id -Source $source
+                [void]$Script:AttemptedUpdates.Remove($attemptKey)
+                [void]$Script:SuccessfulAttemptResults.Remove($attemptKey)
                 Add-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Package $package -Result $result -FailureType 'PackageUpgradeFailure'
             }
         }
@@ -1678,31 +1728,6 @@ function Update-SelectedPackages {
       finally {
         Complete-Operation -Message $Script:StatusLabel.Text
       }
-}
-
-function Get-UnknownPackageRows {
-    $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($row in $Script:Packages.Rows) {
-        if (-not ($row -is [System.Data.DataRow])) {
-            continue
-        }
-
-        if (Test-IsUnknownVersionText -Text ([string](Get-RowValue -Row $row -ColumnName 'CurrentVersion'))) {
-            [void]$rows.Add($row)
-        }
-    }
-
-    return ,$rows
-}
-
-function ConvertTo-CellText {
-    param([object]$Value)
-
-    if ($null -eq $Value -or $Value -is [System.DBNull]) {
-        return ''
-    }
-
-    return ([string]$Value).Trim()
 }
 
 function Get-RowValue {
@@ -1765,12 +1790,6 @@ function Set-RowValue {
     }
 
     throw "Nieprawidlowy typ wiersza tabeli: $($Row.GetType().FullName). Oczekiwano System.Data.DataRow."
-}
-
-function ConvertTo-PowerShellSingleQuotedLiteral {
-    param([string]$Text)
-
-    return "'" + (([string]$Text) -replace "'", "''") + "'"
 }
 
 function Get-SelectedFailedPackageRows {
@@ -2207,7 +2226,7 @@ $bottomPanel.Margin = New-Object System.Windows.Forms.Padding(0)
 [void]$bottomPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
 
 $Script:VersionLabel = New-Object System.Windows.Forms.Label
-$Script:VersionLabel.Text = 'Wersja 1.0'
+$Script:VersionLabel.Text = 'Wersja 1.1.0'
 $Script:VersionLabel.Dock = 'Fill'
 $Script:VersionLabel.TextAlign = 'MiddleLeft'
 $Script:VersionLabel.Font = New-Object System.Drawing.Font('Segoe UI', 8)

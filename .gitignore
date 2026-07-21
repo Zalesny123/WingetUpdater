@@ -11,9 +11,12 @@
 *.sln.docstates
 *.env
 skip-list.json
-Tests&plans/
 repair-contexts/
 .license-accepted
+.kilo/
+.worktrees/
+.playwright-mcp/
+session-ses_*.md
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs

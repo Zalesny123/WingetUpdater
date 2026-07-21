@@ -18,9 +18,8 @@ charset = utf-8-bom
 end_of_line = crlf
 charset = utf-8-bom
 
-[*.bat]
+[*.{bat,cmd}]
 end_of_line = crlf
-charset = utf-8
 
 [*.{md,yml,yaml,json}]
 end_of_line = lf

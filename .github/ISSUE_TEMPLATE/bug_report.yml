@@ -8,11 +8,19 @@ body:
       value: |
         Thank you for reporting a bug! For security issues, please refer to our [Security Policy](https://github.com/Zalesny123/WingetUpdater/blob/main/SECURITY.md).
   - type: input
+    id: app_version
+    attributes:
+      label: WingetUpdater Version
+      description: Which WingetUpdater release or commit are you running?
+      placeholder: e.g. v1.1.0 or commit SHA
+    validations:
+      required: true
+  - type: input
     id: environment
     attributes:
       label: Windows & PowerShell Version
-      description: What version of Windows (10/11) and PowerShell (5.1/7.x) are you running?
-      placeholder: e.g. Windows 11 23H2, PowerShell 7.4.1
+      description: What version of Windows 10 and PowerShell (5.1/7.x) are you running?
+      placeholder: e.g. Windows 10 22H2, PowerShell 7.4.1
     validations:
       required: true
   - type: input
@@ -23,6 +31,14 @@ body:
       placeholder: e.g. v1.7.10861
     validations:
       required: true
+  - type: textarea
+    id: package
+    attributes:
+      label: Package ID And Source
+      description: Provide the affected winget package ID and source, if applicable.
+      placeholder: e.g. Microsoft.PowerToys / winget
+    validations:
+      required: false
   - type: textarea
     id: description
     attributes:
@@ -40,6 +56,13 @@ body:
         2. Click 'Refresh'
         3. Select package '...'
         4. See error '...'
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What happened, including visible status and exit code when available?
     validations:
       required: true
   - type: textarea

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', '', Justification = 'Pester setup variables are consumed by It blocks.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Injected test callbacks must retain production-compatible signatures.')]
@@ -247,9 +247,9 @@ Describe 'Source agreement command arguments' {
         }
     }
 
-    It 'adds source acceptance only to supported source and list commands after consent' {
-        @(New-WingetSourceUpdateArguments -Capabilities $capabilities -SourceAgreementsAccepted $true) |
-            Should -BeExactly @('source', 'update', '--accept-source-agreements')
+    It 'never passes upgrade-only agreement flags to source update but uses them for listing after consent' {
+        @(New-WingetSourceUpdateArguments) |
+            Should -BeExactly @('source', 'update')
         @(New-WingetUpgradeListArguments `
             -Capabilities $capabilities `
             -SourceAgreementsAccepted $true `
@@ -258,14 +258,13 @@ Describe 'Source agreement command arguments' {
     }
 
     It 'omits source acceptance before consent and when each command capability is unavailable' {
-        @(New-WingetSourceUpdateArguments -Capabilities $capabilities -SourceAgreementsAccepted $false) |
+        @(New-WingetSourceUpdateArguments) |
             Should -BeExactly @('source', 'update')
         @(New-WingetUpgradeListArguments -Capabilities $capabilities -SourceAgreementsAccepted $false) |
             Should -Not -Contain '--accept-source-agreements'
 
-        $capabilities.SupportsSourceUpdateAcceptSourceAgreements = $false
         $capabilities.SupportsAcceptSourceAgreements = $false
-        @(New-WingetSourceUpdateArguments -Capabilities $capabilities -SourceAgreementsAccepted $true) |
+        @(New-WingetSourceUpdateArguments) |
             Should -Not -Contain '--accept-source-agreements'
         @(New-WingetUpgradeListArguments -Capabilities $capabilities -SourceAgreementsAccepted $true) |
             Should -Not -Contain '--accept-source-agreements'
@@ -1084,7 +1083,9 @@ Describe 'WingetUpdater Session Failure Registry & AI Handoff' {
     It 'creates and manages unresolved package upgrade failures' {
         $registry = New-WingetUpdaterSessionFailureRegistry
         $pkg = [pscustomobject]@{ Id = 'Vendor.App'; Source = 'winget'; Name = 'Vendor App'; CurrentVersion = '1.0'; AvailableVersion = '2.0'; Scope = 'User' }
-        $res1 = [pscustomobject]@{ ExitCode = 1; DisplayArguments = 'winget upgrade --id Vendor.App'; StandardOutput = 'out1'; StandardError = 'err1'; CombinedOutput = 'out1err1'; LogPath = 'C:\log1.log' }
+        $startedAtUtc = [datetime]'2026-07-21T10:00:00Z'
+        $endedAtUtc = [datetime]'2026-07-21T10:00:05Z'
+        $res1 = [pscustomobject]@{ ExitCode = 1; DisplayCommand = 'winget upgrade --id Vendor.App'; StartedAtUtc = $startedAtUtc; EndedAtUtc = $endedAtUtc; StandardOutput = 'out1'; StandardError = 'err1'; CombinedOutput = 'out1err1'; LogPath = 'C:\log1.log' }
 
         Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $res1 -FailureType 'PackageUpgradeFailure'
 
@@ -1094,18 +1095,51 @@ Describe 'WingetUpdater Session Failure Registry & AI Handoff' {
         $failures[0].AttemptCount | Should -Be 1
         $failures[0].ExitCode | Should -Be 1
         $failures[0].FailureType | Should -Be 'PackageUpgradeFailure'
+        $failures[0].DisplayArguments | Should -BeExactly 'winget upgrade --id Vendor.App'
+        $failures[0].StartedAtUtc | Should -Be $startedAtUtc
+        $failures[0].EndedAtUtc | Should -Be $endedAtUtc
 
         # Retry failure increments attempt count
-        $res2 = [pscustomobject]@{ ExitCode = 2; DisplayArguments = 'winget upgrade --id Vendor.App'; StandardOutput = 'out2'; StandardError = 'err2'; CombinedOutput = 'out2err2'; LogPath = 'C:\log2.log' }
+        $res2 = [pscustomobject]@{ ExitCode = 2; DisplayCommand = 'winget upgrade --id Vendor.App --exact'; StartedAtUtc = $startedAtUtc.AddMinutes(1); EndedAtUtc = $endedAtUtc.AddMinutes(1); StandardOutput = 'out2'; StandardError = 'err2'; CombinedOutput = 'out2err2'; LogPath = 'C:\log2.log' }
         Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $res2 -FailureType 'PackageUpgradeFailure'
 
         $failures2 = @(Get-WingetUpdaterSessionFailures -Registry $registry)
         $failures2.Count | Should -Be 1
         $failures2[0].AttemptCount | Should -Be 2
         $failures2[0].ExitCode | Should -Be 2
+        $failures2[0].DisplayArguments | Should -BeExactly 'winget upgrade --id Vendor.App --exact'
 
         # Success removes package from registry
         Remove-WingetUpdaterSessionFailure -Registry $registry -Id 'Vendor.App' -Source 'winget'
+        @(Get-WingetUpdaterSessionFailures -Registry $registry).Count | Should -Be 0
+    }
+
+    It 'keeps an explicit Ghost attempt count stable across repeated verification refreshes' {
+        $registry = New-WingetUpdaterSessionFailureRegistry
+        $pkg = [pscustomobject]@{ Id = 'Ghost.App'; Source = 'winget'; Name = 'Ghost App'; CurrentVersion = '1.0'; AvailableVersion = '2.0' }
+        $firstResult = [pscustomobject]@{ ExitCode = 0; DisplayCommand = 'winget upgrade --id Ghost.App'; StandardOutput = 'success-one'; StandardError = ''; LogPath = 'C:\ghost1.log' }
+        $secondResult = [pscustomobject]@{ ExitCode = 0; DisplayCommand = 'winget upgrade --id Ghost.App'; StandardOutput = 'success-two'; StandardError = ''; LogPath = 'C:\ghost2.log' }
+
+        Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $firstResult -FailureType 'PostVerificationFailure' -AttemptCountOverride 1
+        Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $firstResult -FailureType 'PostVerificationFailure' -AttemptCountOverride 1
+
+        $afterRefresh = @(Get-WingetUpdaterSessionFailures -Registry $registry)
+        $afterRefresh.Count | Should -Be 1
+        $afterRefresh[0].AttemptCount | Should -Be 1
+
+        Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $secondResult -FailureType 'PostVerificationFailure' -AttemptCountOverride 2
+        $afterRetry = @(Get-WingetUpdaterSessionFailures -Registry $registry)
+        $afterRetry[0].AttemptCount | Should -Be 2
+        $afterRetry[0].StandardOutput | Should -BeExactly 'success-two'
+    }
+
+    It 'never registers a user-cancelled package operation as an AI failure' {
+        $registry = New-WingetUpdaterSessionFailureRegistry
+        $pkg = [pscustomobject]@{ Id = 'Cancelled.App'; Source = 'winget'; Name = 'Cancelled App' }
+        $result = [pscustomobject]@{ Cancelled = $true; ExitCode = $null; StandardOutput = ''; StandardError = '' }
+
+        Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $result
+
         @(Get-WingetUpdaterSessionFailures -Registry $registry).Count | Should -Be 0
     }
 
@@ -1125,7 +1159,9 @@ Describe 'WingetUpdater Session Failure Registry & AI Handoff' {
     It 'generates a UTF-8 repair context file and prompt' {
         $registry = New-WingetUpdaterSessionFailureRegistry
         $pkg = [pscustomobject]@{ Id = 'Fail.App'; Source = 'winget'; Name = 'Failing App'; CurrentVersion = '1.0'; AvailableVersion = '2.0'; Scope = 'User' }
-        $res = [pscustomobject]@{ ExitCode = 123; DisplayArguments = 'winget upgrade --id Fail.App'; StandardOutput = 'Mock stdout'; StandardError = 'Mock stderr'; LogPath = 'C:\log.txt' }
+        $startedAtUtc = [datetime]'2026-07-21T12:00:00Z'
+        $endedAtUtc = [datetime]'2026-07-21T12:00:08Z'
+        $res = [pscustomobject]@{ ExitCode = 123; DisplayCommand = 'winget upgrade --id Fail.App --exact'; StartedAtUtc = $startedAtUtc; EndedAtUtc = $endedAtUtc; StandardOutput = 'Mock stdout'; StandardError = 'Mock stderr'; LogPath = 'C:\log.txt' }
         Add-WingetUpdaterSessionFailure -Registry $registry -Package $pkg -Result $res
 
         $failures = Get-WingetUpdaterSessionFailures -Registry $registry
@@ -1134,11 +1170,62 @@ Describe 'WingetUpdater Session Failure Registry & AI Handoff' {
         (Test-Path -LiteralPath $contextFile -PathType Leaf) | Should -BeTrue
         $content = Get-Content -LiteralPath $contextFile -Raw -Encoding UTF8
         $content | Should -Match 'Fail\.App'
+        $content | Should -Match 'Command Line: winget upgrade --id Fail\.App --exact'
+        $content | Should -Match ([regex]::Escape($startedAtUtc.ToString('o')))
+        $content | Should -Match ([regex]::Escape($endedAtUtc.ToString('o')))
         $content | Should -Match 'Mock stdout'
         $content | Should -Match 'Mock stderr'
 
         $prompt = Get-WingetUpdaterAIPrompt -ContextFilePath $contextFile
         $prompt.Contains($contextFile) | Should -BeTrue
+    }
+
+    It 'resolves only an existing absolute Application path for supported AI CLIs' {
+        Mock -CommandName Get-Command -ModuleName WingetUpdater.Core -MockWith {
+            @(
+                [pscustomobject]@{ CommandType = 'ExternalScript'; Source = 'C:\Tools\codex.ps1' },
+                [pscustomobject]@{ CommandType = 'Application'; Source = 'C:\Tools\codex.cmd' }
+            )
+        }
+        Mock -CommandName Test-Path -ModuleName WingetUpdater.Core -MockWith { $true }
+
+        Resolve-WingetUpdaterAICliPath -CliName 'codex' | Should -BeExactly 'C:\Tools\codex.cmd'
+    }
+
+    It 'rejects relative, missing, and unsupported AI CLI command paths' {
+        Mock -CommandName Get-Command -ModuleName WingetUpdater.Core -MockWith {
+            [pscustomobject]@{ CommandType = 'Application'; Source = 'codex.cmd' }
+        }
+        Mock -CommandName Test-Path -ModuleName WingetUpdater.Core -MockWith { $false }
+
+        Resolve-WingetUpdaterAICliPath -CliName 'codex' | Should -BeNullOrEmpty
+        { Resolve-WingetUpdaterAICliPath -CliName 'gemini' } | Should -Throw '*Unsupported AI CLI*'
+    }
+
+    It 'opens a cmd shim through a trusted command processor with an empty start title' {
+        Mock -CommandName Test-Path -ModuleName WingetUpdater.Core -MockWith { $true }
+        Mock -CommandName Start-Process -ModuleName WingetUpdater.Core -MockWith { }
+
+        Start-WingetUpdaterAICliProcess `
+            -CliPath 'C:\Tools & Apps\codex.cmd' `
+            -CommandProcessorPath 'C:\Windows\System32\cmd.exe'
+
+        Should -Invoke -CommandName Start-Process -ModuleName WingetUpdater.Core -Times 1 -ParameterFilter {
+            $FilePath -eq 'C:\Windows\System32\cmd.exe' -and
+            $ArgumentList -match '/d\s+/c\s+start\s+""\s+"C:\\Tools & Apps\\codex\.cmd"' -and
+            -not $PSBoundParameters.ContainsKey('Verb')
+        }
+    }
+
+    It 'opens an executable AI CLI directly without an intermediate command string' {
+        Mock -CommandName Test-Path -ModuleName WingetUpdater.Core -MockWith { $true }
+        Mock -CommandName Start-Process -ModuleName WingetUpdater.Core -MockWith { }
+
+        Start-WingetUpdaterAICliProcess -CliPath 'C:\Tools\agy.exe'
+
+        Should -Invoke -CommandName Start-Process -ModuleName WingetUpdater.Core -Times 1 -ParameterFilter {
+            $FilePath -eq 'C:\Tools\agy.exe' -and -not $PSBoundParameters.ContainsKey('Verb')
+        }
     }
 }
 
@@ -1152,7 +1239,7 @@ Describe 'WingetUpdater.ps1 storage integration' {
         $scriptText | Should -Match '\$Script:Paths\s*=\s*Get-WingetUpdaterPaths'
         $scriptText | Should -Match '\$Script:StorageInitialization\s*=\s*Initialize-WingetUpdaterStorage'
         $scriptText | Should -Match '\$Script:SkipFile\s*=\s*\$Script:Paths\.SkipListFile'
-        $scriptText | Should -Match '\$Script:RepairDir\s*=\s*\$Script:Paths\.RepairContextsDirectory'
+        $scriptText | Should -Match 'New-WingetUpdaterRepairContextFile\s+-Directory\s+\$Script:Paths\.RepairContextsDirectory'
         $scriptText | Should -Match '\$Script:MockFile\s*=\s*\$Script:Paths\.MockStateFile'
         $scriptText | Should -Not -Match 'Join-Path \$Script:AppDir ''skip-list\.json'''
         $scriptText | Should -Not -Match 'Join-Path \$Script:AppDir ''repair-contexts'''
@@ -1173,8 +1260,12 @@ Describe 'WingetUpdater.ps1 storage integration' {
 }
 
 Describe 'Release Package Manifest' {
-    It 'includes only the required whitelist files in the release distribution' {
+    BeforeAll {
         $root = Split-Path -Parent $PSScriptRoot
+        $releaseWorkflowPath = Join-Path $root '.github/workflows/release.yml'
+        $ciWorkflowPath = Join-Path $root '.github/workflows/ci.yml'
+        $releaseWorkflow = [System.IO.File]::ReadAllText($releaseWorkflowPath)
+        $ciWorkflow = [System.IO.File]::ReadAllText($ciWorkflowPath)
         $whitelist = @(
             'Start.bat',
             'WingetUpdater.ps1',
@@ -1183,10 +1274,167 @@ Describe 'Release Package Manifest' {
             'CHANGELOG.md',
             'LICENSE'
         )
+    }
 
+    It 'builds a release ZIP containing exactly the required root entries' {
+        $root = Split-Path -Parent $PSScriptRoot
         foreach ($file in $whitelist) {
             $path = Join-Path $root $file
             (Test-Path -LiteralPath $path -PathType Leaf) | Should -BeTrue
         }
+
+        $manifestMatch = [regex]::Match($releaseWorkflow, '(?s)\$files\s*=\s*@\((?<body>.*?)\r?\n\s*\)')
+        $manifestMatch.Success | Should -BeTrue
+        $workflowFiles = @([regex]::Matches($manifestMatch.Groups['body'].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+        $workflowFiles | Should -Be $whitelist
+
+        $staging = Join-Path $TestDrive 'release-staging'
+        [void](New-Item -ItemType Directory -Path $staging -Force)
+        foreach ($file in $workflowFiles) {
+            Copy-Item -LiteralPath (Join-Path $root $file) -Destination $staging
+        }
+        $zipPath = Join-Path $TestDrive 'WingetUpdater-v1.1.0.zip'
+        Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zipPath -Force
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            $entries = @($archive.Entries | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) } | ForEach-Object FullName | Sort-Object)
+        }
+        finally {
+            $archive.Dispose()
+        }
+        $entries | Should -Be @($whitelist | Sort-Object)
+        @($entries | Where-Object { $_ -match '(^|/)(tests?|logs?|repair-contexts|\.kilo)(/|$)' }).Count | Should -Be 0
+    }
+
+    It 'pins modules, imports Pester explicitly, and runs both analysis and tests in both Windows shells' {
+        $ciWorkflow | Should -Match 'shell:\s*\[pwsh, powershell\]'
+        $ciWorkflow | Should -Match 'Pester\s+-RequiredVersion\s+6\.0\.1'
+        $ciWorkflow | Should -Match 'PSScriptAnalyzer\s+-RequiredVersion\s+1\.25\.0'
+        $ciWorkflow | Should -Match 'Import-Module\s+Pester\s+-RequiredVersion\s+6\.0\.1'
+        $ciWorkflow | Should -Match 'Import-Module\s+PSScriptAnalyzer\s+-RequiredVersion\s+1\.25\.0'
+        $ciWorkflow | Should -Match 'Invoke-ScriptAnalyzer'
+        $ciWorkflow | Should -Match 'Invoke-Pester'
+    }
+
+    It 'requires an annotated SemVer tag, version consistency, complete gates, and provenance before publishing' {
+        $releaseWorkflow | Should -Match "\^v\(\[0-9\]\+\)\\\.\(\[0-9\]\+\)\\\.\(\[0-9\]\+\)\$"
+        $releaseWorkflow | Should -Match 'git\s+cat-file\s+-t'
+        $releaseWorkflow | Should -Match "-ne\s+'tag'"
+        $releaseWorkflow | Should -Match 'git\s+fetch\s+--no-tags\s+origin\s+main:refs/remotes/origin/main'
+        $releaseWorkflow | Should -Match 'git\s+merge-base\s+--is-ancestor\s+\$tagCommit\s+origin/main'
+        $releaseWorkflow | Should -Match 'README\.md'
+        $releaseWorkflow | Should -Match 'CHANGELOG\.md'
+        $releaseWorkflow | Should -Match 'WingetUpdater\.ps1'
+        $releaseWorkflow | Should -Match '\\d\{4\}-\\d\{2\}-\\d\{2\}'
+        $releaseWorkflow | Should -Match 'matrix:'
+        $releaseWorkflow | Should -Match 'shell:\s*\[pwsh, powershell\]'
+        $releaseWorkflow | Should -Match 'Invoke-ScriptAnalyzer'
+        $releaseWorkflow | Should -Match 'Invoke-Pester'
+        $releaseWorkflow | Should -Match 'actions/attest-build-provenance@[0-9a-f]{40}'
+        $releaseWorkflow | Should -Match 'attestations:\s*write'
+        $releaseWorkflow | Should -Match 'id-token:\s*write'
+    }
+
+    It 'builds the ZIP with deterministic entry order and tag-derived timestamps' {
+        $releaseWorkflow | Should -Not -Match 'Compress-Archive'
+        $releaseWorkflow | Should -Match 'ZipArchiveMode\]::Create'
+        $releaseWorkflow | Should -Match 'git\s+show\s+-s\s+--format=%ct\s+HEAD'
+        $releaseWorkflow | Should -Match '\.LastWriteTime\s*=\s*\$releaseTimestamp'
+        $releaseWorkflow | Should -Match '\$files\s*\|\s*Sort-Object'
+    }
+
+    It 'uploads all assets to a draft before publishing the immutable release' {
+        $draftIndex = $releaseWorkflow.IndexOf('draft: true')
+        $publishIndex = $releaseWorkflow.IndexOf('gh release edit')
+
+        $draftIndex | Should -BeGreaterOrEqual 0
+        $publishIndex | Should -BeGreaterThan $draftIndex
+        $releaseWorkflow | Should -Match 'gh\s+release\s+edit[^\r\n]+--draft=false[^\r\n]+--latest'
+        $releaseWorkflow | Should -Match 'GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}'
+    }
+
+    It 'keeps every GitHub Action pinned to a full commit SHA' {
+        $actionReferences = [regex]::Matches($ciWorkflow + "`n" + $releaseWorkflow, 'uses:\s*[^\s]+@(?<ref>[^\s#]+)')
+        $actionReferences.Count | Should -BeGreaterThan 0
+        foreach ($reference in $actionReferences) {
+            $reference.Groups['ref'].Value | Should -Match '^[0-9a-f]{40}$'
+        }
+    }
+
+    It 'pins the native Node.js 24 checkout action to the verified v7 commit' {
+        $verifiedCheckout = 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+        $ciWorkflow | Should -Match ([regex]::Escape($verifiedCheckout))
+        ([regex]::Matches($releaseWorkflow, [regex]::Escape($verifiedCheckout))).Count | Should -Be 2
+    }
+}
+
+Describe 'Public project metadata consistency' {
+    BeforeAll {
+        $root = Split-Path -Parent $PSScriptRoot
+        $readmeText = [System.IO.File]::ReadAllText((Join-Path $root 'README.md'))
+        $contributingText = [System.IO.File]::ReadAllText((Join-Path $root 'CONTRIBUTING.md'))
+        $releasingText = [System.IO.File]::ReadAllText((Join-Path $root 'RELEASING.md'))
+        $changelogText = [System.IO.File]::ReadAllText((Join-Path $root 'CHANGELOG.md'))
+        $bugReportText = [System.IO.File]::ReadAllText((Join-Path $root '.github/ISSUE_TEMPLATE/bug_report.yml'))
+        $editorConfigText = [System.IO.File]::ReadAllText((Join-Path $root '.editorconfig'))
+        $gitAttributesText = [System.IO.File]::ReadAllText((Join-Path $root '.gitattributes'))
+    }
+
+    It 'documents the same pinned test and analyzer versions as CI' {
+        foreach ($text in @($readmeText, $contributingText, $releasingText)) {
+            $text | Should -Match 'Pester[^\r\n]*6\.0\.1'
+            $text | Should -Match 'PSScriptAnalyzer[^\r\n]*1\.25\.0'
+        }
+    }
+
+    It 'documents protected tags and immutable release publication' {
+        $releasingText | Should -Match '(?i)release tags?.*protected|protected.*release tags?'
+        $releasingText | Should -Match '(?i)immutable release'
+        $releasingText | Should -Match '(?i)draft.*assets.*publish'
+    }
+
+    It 'keeps v1.1.0 as the current development or dated release section' {
+        $changelogText | Should -Match '(?m)^## \[1\.1\.0\] - (?:Unreleased|\d{4}-\d{2}-\d{2})$'
+    }
+
+    It 'preserves published v1.0.1 and v1.0.2 history before v1.0.0' {
+        $v11 = [regex]::Match($changelogText, '(?m)^## \[1\.1\.0\] - (?:Unreleased|\d{4}-\d{2}-\d{2})$').Index
+        $v102 = $changelogText.IndexOf('## [1.0.2] - 2026-07-21')
+        $v101 = $changelogText.IndexOf('## [1.0.1] - 2026-07-21')
+        $v100 = $changelogText.IndexOf('## [1.0.0] - 2026-05-30')
+        $v11 | Should -BeGreaterOrEqual 0
+        $v102 | Should -BeGreaterThan $v11
+        $v101 | Should -BeGreaterThan $v102
+        $v100 | Should -BeGreaterThan $v101
+        $changelogText | Should -Match '(?ms)^## \[1\.1\.0\].*?^### Improved$'
+        $changelogText | Should -Match '(?ms)^## \[1\.1\.0\].*?^### Fixed$'
+    }
+
+    It 'does not instruct editors to rewrite the ASCII batch launcher as UTF-8' {
+        $batchSection = [regex]::Match($editorConfigText, '(?ms)^\[\*\.\{bat,cmd\}\]\s*(?<body>.*?)(?=^\[|\z)')
+        $batchSection.Success | Should -BeTrue
+        $batchSection.Groups['body'].Value | Should -Not -Match '(?m)^charset\s*='
+        $gitAttributesText | Should -Match '(?m)^\*\.bat\s+text\s+eol=crlf$'
+        $gitAttributesText | Should -Match '(?m)^\*\.cmd\s+text\s+eol=crlf$'
+    }
+
+    It 'keeps every PowerShell source and test file as UTF-8 BOM with CRLF endings' {
+        $powerShellFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object {
+            $_.Extension -in @('.ps1', '.psm1', '.psd1')
+        })
+        $powerShellFiles.Count | Should -BeGreaterThan 0
+
+        foreach ($file in $powerShellFiles) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            @($bytes[0..2]) | Should -Be @(0xEF, 0xBB, 0xBF) -Because $file.FullName
+            $text = (New-Object System.Text.UTF8Encoding($true, $true)).GetString($bytes)
+            ($text -replace "`r`n", '') | Should -Not -Match "[`r`n]" -Because $file.FullName
+        }
+    }
+
+    It 'collects bug reports only for the supported Windows 10 release line' {
+        $bugReportText | Should -Match 'Windows 10'
+        $bugReportText | Should -Not -Match 'Windows 11'
     }
 }
