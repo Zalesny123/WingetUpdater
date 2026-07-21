@@ -1362,8 +1362,8 @@ Describe 'Release Package Manifest' {
         }
     }
 
-    It 'pins actions checkout to the verified v4.1.7 commit' {
-        $verifiedCheckout = 'actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332'
+    It 'pins the native Node.js 24 checkout action to the verified v7 commit' {
+        $verifiedCheckout = 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
         $ciWorkflow | Should -Match ([regex]::Escape($verifiedCheckout))
         ([regex]::Matches($releaseWorkflow, [regex]::Escape($verifiedCheckout))).Count | Should -Be 2
     }
