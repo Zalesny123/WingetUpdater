@@ -856,7 +856,6 @@ function Initialize-WingetInfo {
         VersionText = $versionText
         Version = $version
         SupportsAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
-        SupportsSourceUpdateAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
         SupportsAcceptPackageAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-package-agreements'
         SupportsDisableInteractivity = Test-WingetHelpOption -HelpText $helpText -Option '--disable-interactivity'
         SupportsIncludeUnknown = $supportsIncludeUnknown

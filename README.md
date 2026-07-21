@@ -59,7 +59,7 @@ if ($actual -ne $expected) { throw 'SHA-256 checksum mismatch.' }
 
 Expected release archive structure:
 
-```cmd
+```text
 Start.bat
 WingetUpdater.ps1
 WingetUpdater.Core.psm1
