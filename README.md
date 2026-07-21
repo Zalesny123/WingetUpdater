@@ -4,7 +4,7 @@
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**Version:** 1.0.1
+**Version:** 1.0.2
 
 **WingetUpdater** is a graphical Windows tool for checking and updating installed software using Windows Package Manager (`winget`).
 
