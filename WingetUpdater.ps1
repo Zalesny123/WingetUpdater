@@ -10,15 +10,15 @@
 # Dziala w Windows PowerShell 5.1 oraz PowerShell 7+ na Windows.
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '', Justification = 'Private WinForms event helpers use application-oriented names.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'This script is an interactive GUI; confirmation is handled by dialogs and winget/UAC.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'This script is an interactive GUI; confirmation is handled by dialogs and winget installers.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '', Justification = 'Private helpers intentionally use collection-oriented names.')]
 param (
-    [string]$LauncherSecret = ''
+    [switch]$LaunchedFromStartBat
 )
 
 Set-StrictMode -Version 2.0
 
-if ($LauncherSecret -ne 'StartBat123') {
+if (-not $LaunchedFromStartBat) {
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.MessageBox]::Show(
         "Ten program musi byc uruchamiany wylacznie za pomoca pliku Start.bat.",
@@ -46,12 +46,59 @@ if ([string]::IsNullOrWhiteSpace($scriptPath)) {
 }
 
 $Script:AppDir = Split-Path -Parent $scriptPath
-$Script:SkipFile = Join-Path $Script:AppDir 'skip-list.json'
-$Script:RepairDir = Join-Path $Script:AppDir 'repair-contexts'
-$Script:SkippedIds = @{}
-$Script:AttemptedUpdates = @{}
-$Script:WingetInfo = $null
-$Script:MinimumWingetVersion = [version]'1.4.0'
+Import-Module -Name (Join-Path $Script:AppDir 'WingetUpdater.Core.psm1') -Force -DisableNameChecking -ErrorAction Stop
+$Script:MutexLease = $null
+$Script:ToolTip = $null
+$Script:Form = $null
+$Script:ClosePending = $false
+$Script:CancellationState = New-WingetUpdaterCancellationState
+$Script:CurrentWingetProcess = $null
+$Script:SourceAgreementsAccepted = $false
+
+function Dispose-WingetUpdaterResource {
+    param(
+        [AllowNull()][object]$Resource,
+        [string]$ResourceName
+    )
+
+    if ($null -eq $Resource -or $Resource -isnot [System.IDisposable]) {
+        return
+    }
+
+    try {
+        $Resource.Dispose()
+    }
+    catch {
+        Write-Verbose "Disposing $ResourceName failed: $($_.Exception.Message)"
+    }
+}
+
+try {
+    $currentUserSid = Get-WingetUpdaterCurrentUserSid
+    $Script:MutexLease = Enter-WingetUpdaterSingleInstance -UserSid $currentUserSid
+    if (-not $Script:MutexLease.IsFirstInstance) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Inna instancja programu jest juz uruchomiona dla tego uzytkownika.',
+            'Winget Updater',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        exit 0
+    }
+
+    $Script:Paths = Get-WingetUpdaterPaths
+    $Script:StorageInitialization = Initialize-WingetUpdaterStorage -Paths $Script:Paths -LegacyAppDirectory $Script:AppDir
+    $Script:StartupWarnings = @($Script:StorageInitialization.Warnings)
+    $Script:SourceAgreementsAccepted = [bool]$Script:StorageInitialization.SourceAgreementsAccepted
+    $Script:SkipFile = $Script:Paths.SkipListFile
+    $Script:RepairDir = $Script:Paths.RepairContextsDirectory
+    $Script:SkippedIds = @{}
+    $Script:AttemptedUpdates = @{}
+    $Script:UnresolvedFailures = New-WingetUpdaterSessionFailureRegistry
+    $Script:SuccessfulAttemptResults = @{}
+    $Script:WingetInfo = $null
+    $Script:MinimumWingetVersion = [version]'1.4.0'
+    $Script:IsBusy = $false
 $Script:RefreshButton = $null
 $Script:UpdateButton = $null
 $Script:SaveButton = $null
@@ -60,13 +107,12 @@ $Script:UpdateAllButton = $null
 $Script:UpdateNoneButton = $null
 $Script:SkipAllButton = $null
 $Script:SkipNoneButton = $null
-$Script:RepairButton = $null
-$Script:SourceUpdateButton = $null
+$Script:CopyMessageButton = $null
+$Script:OpenAiCliButton = $null
+$Script:CancelButton = $null
 $Script:SilentCheck = $null
 $Script:InteractiveCheck = $null
 $Script:IncludeUnknownCheck = $null
-$Script:SourceUpdateCheck = $null
-$Script:TerminalCombo = $null
 $Script:AgentCombo = $null
 $Script:ToolTip = $null
 $Script:StatusLabel = $null
@@ -82,24 +128,25 @@ $Script:LogLiveRenderedText = ''
 $Script:LastLogLiveUpdate = [datetime]::MinValue
 $Script:Grid = $null
 $Script:LogBox = $null
+$Script:MaxLogBoxCharacters = 200000
 $Script:Form = $null
 $Script:TestModeCheck = $null
-$Script:TestDir = Join-Path $Script:AppDir 'Tests'
-$Script:MockFile = Join-Path $Script:TestDir 'MockState.json'
+$Script:TestDir = $Script:Paths.MockDirectory
+$Script:MockFile = $Script:Paths.MockStateFile
 
 function Reset-MockState {
     $data = [ordered]@{
-        'Test.UserOK' = @{ Name = 'Aplikacja Zwykla (User)'; Current = '1.0'; Available = '2.0'; Scope = 'User'; ExitCode = 0; AdminExitCode = 0; Ghost = $false }
-        'Test.MachineOK' = @{ Name = 'Aplikacja Systemowa (Admin)'; Current = '1.0'; Available = '2.0'; Scope = 'Machine'; ExitCode = 0; AdminExitCode = 0; Ghost = $false }
-        'Test.SpotifyLike' = @{ Name = 'Aplikacja Spotify-podobna'; Current = '1.0'; Available = '2.0'; Scope = 'User'; ExitCode = 0; AdminExitCode = -1978335146; Ghost = $false }
-        'Test.OperaLike' = @{ Name = 'Aplikacja Opera-podobna'; Current = '1.0'; Available = '2.0'; Scope = 'Machine'; ExitCode = -1978335212; AdminExitCode = -1978335212; Ghost = $false }
-        'Test.Uparty' = @{ Name = 'Aplikacja Uparta (Ghost)'; Current = '1.0'; Available = '2.0'; Scope = 'Machine'; ExitCode = 0; AdminExitCode = 0; Ghost = $true }
-        'Test.UnknownVer' = @{ Name = 'Aplikacja Unknown'; Current = 'Unknown'; Available = '2.0'; Scope = 'User'; ExitCode = 0; AdminExitCode = 0; Ghost = $false }
+        'Test.FirstOK' = @{ Name = 'Aplikacja Pierwsza'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $false }
+        'Test.SecondOK' = @{ Name = 'Aplikacja Druga'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $false }
+        'Test.SpotifyLike' = @{ Name = 'Aplikacja Spotify-podobna'; Current = '1.0'; Available = '2.0'; ExitCode = -1978335146; Ghost = $false }
+        'Test.OperaLike' = @{ Name = 'Aplikacja Opera-podobna'; Current = '1.0'; Available = '2.0'; ExitCode = -1978335212; Ghost = $false }
+        'Test.Uparty' = @{ Name = 'Aplikacja Uparta (Ghost)'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $true }
+        'Test.UnknownVer' = @{ Name = 'Aplikacja Unknown'; Current = 'Unknown'; Available = '2.0'; ExitCode = 0; Ghost = $false }
     }
     if (-not (Test-Path -LiteralPath $Script:TestDir)) {
         [void](New-Item -ItemType Directory -Path $Script:TestDir -Force)
     }
-    $data | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Script:MockFile -Encoding UTF8
+    Write-WingetUpdaterJson -Path $Script:MockFile -Data $data
 }
 
 function New-PackagesTable {
@@ -117,51 +164,6 @@ function New-PackagesTable {
 }
 
 $Script:Packages = New-PackagesTable
-
-function Test-IsAdministrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Ensure-RunningAsAdministrator {
-    if (Test-IsAdministrator) {
-        return
-    }
-
-    if (-not (Test-Path -LiteralPath $scriptPath)) {
-        throw "Program musi byc uruchomiony jako administrator, ale nie udalo sie odnalezc pliku skryptu: $scriptPath"
-    }
-
-    $hostPath = (Get-Process -Id $PID).Path
-    if ([string]::IsNullOrWhiteSpace($hostPath)) {
-        if ($PSVersionTable.PSEdition -eq 'Core') {
-            $hostPath = 'pwsh.exe'
-        }
-        else {
-            $hostPath = 'powershell.exe'
-        }
-    }
-
-    try {
-        Start-Process `
-            -FilePath $hostPath `
-            -Verb RunAs `
-            -WorkingDirectory ([Environment]::GetFolderPath('UserProfile')) `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $scriptPath)
-    }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Nie udalo sie uruchomic programu jako administrator.`r`n$($_.Exception.Message)",
-            'Winget Updater',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-        exit 1
-    }
-
-    exit 0
-}
 
 function Get-PowerShellRuntimeText {
     $edition = 'Desktop'
@@ -227,6 +229,15 @@ function Get-PackageIssueType {
     return ''
 }
 
+function Get-PackageAttemptKey {
+    param(
+        [string]$Id,
+        [string]$Source
+    )
+
+    return $Id.Trim() + [char]0 + $Source.Trim()
+}
+
 function Load-SkipList {
     $Script:SkippedIds = @{}
 
@@ -235,25 +246,7 @@ function Load-SkipList {
     }
 
     try {
-        $raw = Get-Content -LiteralPath $Script:SkipFile -Raw
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            return
-        }
-
-        $data = $raw | ConvertFrom-Json
-        $ids = @()
-
-        if ($data -is [array]) {
-            $ids = $data
-        }
-        elseif ($null -ne $data.skippedIds) {
-            $ids = $data.skippedIds
-        }
-        elseif ($null -ne $data.SkippedIds) {
-            $ids = $data.SkippedIds
-        }
-
-        foreach ($id in $ids) {
+        foreach ($id in @(Read-WingetUpdaterSkipIds -Path $Script:SkipFile)) {
             $idText = ([string]$id).Trim()
             if ($idText.Length -gt 0) {
                 $Script:SkippedIds[$idText] = $true
@@ -267,84 +260,6 @@ function Load-SkipList {
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         ) | Out-Null
-    }
-}
-
-function ConvertTo-PlainText {
-    param([string]$Text)
-
-    if ($null -eq $Text) {
-        return ''
-    }
-
-    $escape = [regex]::Escape([string][char]27)
-    $withoutAnsi = [regex]::Replace($Text, "$escape\[[0-?]*[ -/]*[@-~]", '')
-    $plain = ($withoutAnsi -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
-    return Repair-DisplayText -Text $plain
-}
-
-function Repair-DisplayText {
-    param([string]$Text)
-
-    if ($null -eq $Text) {
-        return ''
-    }
-
-    $value = [string]$Text
-    $value = $value.Replace([string][char]0x2026, '...')
-    $ellipsisForms = @(
-        ([string]::Concat([char]0x00D4, [char]0x00C7, [char]0x00AA)),
-        ([string]::Concat([char]0x00D4, [char]0x00C7, [char]0x017D)),
-        ([string]::Concat([char]0x0393, [char]0x00C7, [char]0x00AA)),
-        ([string]::Concat([char]0x00E2, [char]0x20AC, [char]0x00A6))
-    )
-    foreach ($form in $ellipsisForms) {
-        $value = $value.Replace($form, '...')
-    }
-
-    $dashForms = @(
-        ([string]::Concat([char]0x00D4, [char]0x00C7, [char]0x00F4)),
-        ([string]::Concat([char]0x0393, [char]0x00C7, [char]0x00F4)),
-        ([string]::Concat([char]0x00E2, [char]0x20AC, [char]0x201C)),
-        ([string]::Concat([char]0x00D4, [char]0x00C7, [char]0x00F6)),
-        ([string]::Concat([char]0x0393, [char]0x00C7, [char]0x00F6)),
-        ([string]::Concat([char]0x00E2, [char]0x20AC, [char]0x201D))
-    )
-    foreach ($form in $dashForms) {
-        $value = $value.Replace($form, '-')
-    }
-
-    return $value.Trim()
-}
-
-function Parse-WingetPackageLine {
-    param([string]$Line)
-
-    $lineText = Repair-DisplayText -Text $Line
-    if ([string]::IsNullOrWhiteSpace($lineText)) {
-        return $null
-    }
-
-    # Read from the right side. Long names can contain a display ellipsis and
-    # shift fixed-width columns, but Source, Available, Version, and Id remain
-    # the last four whitespace-separated tokens.
-    $match = [regex]::Match($lineText, '^\s*(?<name>.+?)\s+(?<id>\S+)\s+(?<current>(?:[<>]\s+)?\S+)\s+(?<available>\S+)\s+(?<source>\S+)\s*$')
-    if (-not $match.Success) {
-        return $null
-    }
-
-    $id = Repair-DisplayText -Text $match.Groups['id'].Value
-    $available = Repair-DisplayText -Text $match.Groups['available'].Value
-    if ([string]::IsNullOrWhiteSpace($id) -or [string]::IsNullOrWhiteSpace($available)) {
-        return $null
-    }
-
-    return [pscustomobject]@{
-        Name = Repair-DisplayText -Text $match.Groups['name'].Value
-        Id = $id
-        CurrentVersion = Repair-DisplayText -Text $match.Groups['current'].Value
-        AvailableVersion = $available
-        Source = Repair-DisplayText -Text $match.Groups['source'].Value
     }
 }
 
@@ -593,394 +508,310 @@ function Update-LogLiveLine {
     }
     $Script:LogLiveRenderedText = $liveLine
 
+    Limit-LogBoxBuffer
     $Script:LogBox.SelectionStart = $Script:LogBox.TextLength
     $Script:LogBox.ScrollToCaret()
     $Script:LogBox.ResumeLayout()
 }
 
-function Parse-WingetUpgradeOutput {
-    param([string]$Output)
+function New-MockWingetResult {
+    param(
+        [string[]]$Arguments,
+        [string]$StandardOutput,
+        [string]$StandardError,
+        [AllowNull()][Nullable[int]]$ExitCode,
+        [AllowNull()][object]$Package,
+        [bool]$Cancelled = $false
+    )
 
-    $text = ConvertTo-PlainText $Output
-    $lines = $text -split "`r?`n"
-    $packages = New-Object System.Collections.Generic.List[object]
-    $seenIds = @{}
-
-    for ($scan = 0; $scan -lt $lines.Count; $scan++) {
-        if ($lines[$scan] -notmatch '^\s*-{5,}\s*$' -and $lines[$scan] -notmatch '^\s*-{2,}(\s+-{2,}){3,}\s*$') {
-            continue
-        }
-
-        $seenRowsInTable = $false
-        for ($i = $scan + 1; $i -lt $lines.Count; $i++) {
-            $line = $lines[$i]
-
-            if ([string]::IsNullOrWhiteSpace($line)) {
-                if ($seenRowsInTable) {
-                    break
-                }
-                continue
-            }
-
-            if ($line -match '^\s*-{5,}\s*$' -or $line -match '^\s*-{2,}(\s+-{2,}){3,}\s*$') {
-                break
-            }
-
-            $package = Parse-WingetPackageLine -Line $line
-            if ($null -eq $package) {
-                continue
-            }
-
-            $id = $package.Id
-            $available = $package.AvailableVersion
-            if ($id -eq 'Id' -or $available -eq 'Available' -or $seenIds.ContainsKey($id)) {
-                continue
-            }
-
-            $seenIds[$id] = $true
-            $seenRowsInTable = $true
-            [void]$packages.Add($package)
-        }
-
-        $scan = $i
+    $startedAtUtc = [datetime]::UtcNow
+    $displayCommand = 'mock-winget'
+    if ($Arguments.Count -gt 0) {
+        $displayCommand += ' ' + (Join-CommandLineArguments -Arguments $Arguments)
     }
+    $logPath = Join-Path $Script:Paths.LogsDirectory ([datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-mock-' + [guid]::NewGuid().ToString('N') + '.log')
+    $combinedOutput = [string]$StandardOutput + [string]$StandardError
+    $packageId = if ($null -ne $Package) { [string]$Package.Id } else { '' }
+    $packageName = if ($null -ne $Package) { [string]$Package.Name } else { '' }
+    $currentVersion = if ($null -ne $Package) { [string]$Package.CurrentVersion } else { '' }
+    $availableVersion = if ($null -ne $Package) { [string]$Package.AvailableVersion } else { '' }
+    $source = if ($null -ne $Package) { [string]$Package.Source } else { '' }
+    $endedAtUtc = [datetime]::UtcNow
+    $exitCodeText = if ($null -eq $ExitCode) { '' } else { [string]$ExitCode }
+    $logText = @(
+        "Log: $logPath"
+        'Application: mock-winget'
+        "Command: $displayCommand"
+        "StartedAtUtc: $($startedAtUtc.ToString('o'))"
+        "EndedAtUtc: $($endedAtUtc.ToString('o'))"
+        "ExitCode: $exitCodeText"
+        "Cancelled: $($Cancelled.ToString().ToLowerInvariant())"
+        "PackageId: $packageId"
+        "PackageName: $packageName"
+        "CurrentVersion: $currentVersion"
+        "AvailableVersion: $availableVersion"
+        "Source: $source"
+        ''
+        '[stdout]'
+        [string]$StandardOutput
+        '[stderr]'
+        [string]$StandardError
+        '[combined]'
+        $combinedOutput
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText($logPath, $logText, (New-Object System.Text.UTF8Encoding($false)))
 
-    return $packages.ToArray()
+    return [pscustomobject][ordered]@{
+        ApplicationPath = 'mock-winget'
+        Arguments = [string[]]@($Arguments)
+        DisplayCommand = $displayCommand
+        Package = $Package
+        PackageId = $packageId
+        PackageName = $packageName
+        CurrentVersion = $currentVersion
+        AvailableVersion = $availableVersion
+        Source = $source
+        StartedAtUtc = $startedAtUtc
+        EndedAtUtc = $endedAtUtc
+        Started = $true
+        InfrastructureError = ''
+        CleanupGuaranteed = $true
+        ExitCode = $ExitCode
+        Cancelled = $Cancelled
+        StandardOutput = [string]$StandardOutput
+        StandardError = [string]$StandardError
+        CombinedOutput = $combinedOutput
+        LogPath = $logPath
+    }
 }
 
-function ConvertTo-CommandLineArgument {
-    param([string]$Argument)
-
-    if ($null -eq $Argument) {
-        return '""'
+function Invoke-WingetUiHeartbeat {
+    Step-Spinner
+    $formType = 'System.Windows.Forms.Form' -as [type]
+    if ($null -eq $Script:Form -or $null -eq $formType -or -not $formType.IsInstanceOfType($Script:Form)) {
+        return
     }
-
-    if ($Argument.Length -eq 0) {
-        return '""'
-    }
-
-    if ($Argument -notmatch '[\s"]') {
-        return $Argument
-    }
-
-    return '"' + ($Argument -replace '"', '\"') + '"'
+    [System.Windows.Forms.Application]::DoEvents()
 }
 
-function Join-CommandLineArguments {
-    param([string[]]$Arguments)
+function Assert-WingetCleanupGuaranteed {
+    param([object]$Result)
 
-    $parts = New-Object System.Collections.Generic.List[string]
-    foreach ($argument in $Arguments) {
-        [void]$parts.Add((ConvertTo-CommandLineArgument -Argument $argument))
+    if (-not [bool]$Result.CleanupGuaranteed) {
+        Append-Log "BLAD BEZPIECZENSTWA PROCESU: nie potwierdzono zakonczenia procesu potomnego. Polecenie: $($Result.DisplayCommand). Log: $($Result.LogPath)"
+        throw "Nie potwierdzono zakonczenia procesu winget. Dalsze polecenia zostaly przerwane. Log: $($Result.LogPath)"
+    }
+}
+
+function Invoke-MockWingetDelay {
+    param(
+        [int]$Milliseconds,
+        [scriptblock]$OnPulse,
+        [object]$CancellationState
+    )
+
+    $remaining = [Math]::Max(0, $Milliseconds)
+    while ($remaining -gt 0) {
+        if (Test-WingetUpdaterCancellationRequested -State $CancellationState) {
+            return $false
+        }
+        if ($null -ne $OnPulse) {
+            & $OnPulse
+        }
+        if (Test-WingetUpdaterCancellationRequested -State $CancellationState) {
+            return $false
+        }
+
+        $slice = [Math]::Min(50, $remaining)
+        Start-Sleep -Milliseconds $slice
+        $remaining -= $slice
     }
 
-    return ($parts.ToArray() -join ' ')
+    if ($null -ne $OnPulse) {
+        & $OnPulse
+    }
+    return (-not (Test-WingetUpdaterCancellationRequested -State $CancellationState))
 }
 
 function Invoke-Winget {
     param(
+        [string]$ApplicationPath,
         [string[]]$Arguments,
-        [switch]$LiveLog
+        [AllowNull()][object]$Package,
+        [switch]$LiveLog,
+        [scriptblock]$OnPulse
     )
 
-    # --- POCZĄTEK: PRZECHWYCENIE WINGET DLA TRYBU TESTOWEGO ---
     if ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked) {
         if (-not (Test-Path -LiteralPath $Script:MockFile)) { Reset-MockState }
-        if ($Arguments -contains '--version') { return [pscustomobject]@{ Output = "v1.9.0-mock"; ExitCode = 0 } }
-        if ($Arguments -contains '--help') { return [pscustomobject]@{ Output = "--include-unknown --exact --accept-package-agreements --accept-source-agreements --disable-interactivity --silent --source"; ExitCode = 0 } }
-        if ($Arguments -contains 'source' -and $Arguments -contains 'update') { return [pscustomobject]@{ Output = "Source updated"; ExitCode = 0 } }
-
-        $mock = Get-Content -LiteralPath $Script:MockFile -Raw | ConvertFrom-Json
-
-        if ($Arguments -contains 'show' -and $Arguments -contains '--id') {
-            $idIdx = [array]::IndexOf($Arguments, '--id') + 1
-            if ($idIdx -le 0 -or $idIdx -ge $Arguments.Count) {
-                return [pscustomobject]@{ Output = "Missing mock package id"; ExitCode = 1 }
-            }
-
-            $id = $Arguments[$idIdx]
-            $pkg = $mock.$id
-            if ($null -eq $pkg) {
-                return [pscustomobject]@{ Output = "Mock package not found: $id"; ExitCode = 1 }
-            }
-
-            return [pscustomobject]@{ Output = "Installer Scope: $($pkg.Scope)"; ExitCode = 0 }
+        $mockPulseCallback = $OnPulse
+        $mockSpinnerStarted = $false
+        if ($LiveLog -and $null -eq $mockPulseCallback) {
+            Start-Spinner
+            $mockSpinnerStarted = $true
+            $mockPulseCallback = { Invoke-WingetUiHeartbeat }
         }
 
-        # Symulacja wyszukiwania aktualizacji
-        if ($Arguments -contains 'upgrade' -and $Arguments -notcontains '--id') {
-            $out = "Name Id Version Available Source`n"
-            $out += "---- -- ------- --------- ------`n"
+        try {
+        $standardOutput = ''
+        $standardError = ''
+        $exitCode = 0
+
+        if ($Arguments -contains '--version') {
+            $standardOutput = 'v1.9.0-mock'
+        }
+        elseif ($Arguments -contains '--help') {
+            $standardOutput = '--include-unknown --exact --accept-package-agreements --accept-source-agreements --disable-interactivity --interactive --silent --source'
+        }
+        elseif ($Arguments -contains 'source' -and $Arguments -contains 'update') {
+            $standardOutput = 'Source updated'
+        }
+        elseif ($Arguments -contains 'upgrade' -and $Arguments -notcontains '--id') {
+            $mock = Read-WingetUpdaterJson -Path $Script:MockFile
+            $standardOutput = "Name Id Version Available Source`n"
+            $standardOutput += "---- -- ------- --------- ------`n"
             foreach ($key in $mock.PSObject.Properties.Name) {
                 $pkg = $mock.$key
                 if ($pkg.Current -ne $pkg.Available) {
-                    $out += "$($pkg.Name) $key $($pkg.Current) $($pkg.Available) winget`n"
+                    $standardOutput += "$($pkg.Name) $key $($pkg.Current) $($pkg.Available) winget`n"
                 }
             }
-            if ($LiveLog) { Start-Sleep -Milliseconds 500 }
-            return [pscustomobject]@{ Output = $out; ExitCode = 0 }
+            if ($LiveLog -or $null -ne $mockPulseCallback) {
+                [void](Invoke-MockWingetDelay -Milliseconds 500 -OnPulse $mockPulseCallback -CancellationState $Script:CancellationState)
+            }
         }
-
-        # Symulacja instalacji User
-        if ($Arguments -contains 'upgrade' -and $Arguments -contains '--id') {
+        elseif ($Arguments -contains 'upgrade' -and $Arguments -contains '--id') {
+            $mock = Read-WingetUpdaterJson -Path $Script:MockFile
             $idIdx = [array]::IndexOf($Arguments, '--id') + 1
             $id = $Arguments[$idIdx]
             $pkg = $mock.$id
             if ($null -eq $pkg) {
-                return [pscustomobject]@{ Output = "Mock package not found: $id"; ExitCode = 1 }
+                $standardError = "Mock package not found: $id"
+                $exitCode = 1
             }
-
-            if ($LiveLog) {
+            $delayCompleted = $true
+            if ($LiveLog -or $null -ne $mockPulseCallback) {
+                $delayCompleted = Invoke-MockWingetDelay -Milliseconds 300 -OnPulse $mockPulseCallback -CancellationState $Script:CancellationState
+            }
+            if ($delayCompleted -and $LiveLog) {
                 Update-LogLiveLine -Spinner "-"
-                Start-Sleep -Milliseconds 300
                 Update-LogLiveLine -Progress "50%"
-                Start-Sleep -Milliseconds 300
-                Update-LogLiveLine -Progress "100%"
-            }
-
-            if ($pkg.ExitCode -ne 0) { return [pscustomobject]@{ Output = "Error"; ExitCode = $pkg.ExitCode } }
-            if (-not $pkg.Ghost) {
-                $pkg.Current = $pkg.Available
-                $mock | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Script:MockFile -Encoding UTF8
-            }
-            return [pscustomobject]@{ Output = "Success"; ExitCode = 0 }
-        }
-        return [pscustomobject]@{ Output = ""; ExitCode = 0 }
-    }
-    # --- KONIEC: PRZECHWYCENIE WINGET DLA TRYBU TESTOWEGO ---
-
-    $outputBuilder = New-Object System.Text.StringBuilder
-    $process = $null
-    $cr = [char]13
-    $lf = [char]10
-
-    $processOutputLine = {
-        param(
-            [string]$RawLine,
-            [bool]$IsTransient
-        )
-
-        if ($null -eq $RawLine) {
-            return
-        }
-
-        $line = ConvertTo-PlainText $RawLine
-        if ($IsTransient -and [string]::IsNullOrWhiteSpace($line)) {
-            return
-        }
-
-        [void]$outputBuilder.AppendLine($line)
-        if (Test-IsWingetSpinnerLine -Line $line) {
-            if ($LiveLog) {
-                Step-Spinner
-                Update-LogLiveLine -Spinner $line
-            }
-            return
-        }
-
-        $progressText = Get-WingetProgressText -Line $line
-        if ($LiveLog -and -not [string]::IsNullOrWhiteSpace($progressText)) {
-            Update-LogLiveLine -Progress $progressText
-            return
-        }
-
-        if ($LiveLog -and $IsTransient) {
-            Update-LogLiveLine -Progress $line
-            return
-        }
-
-        if ($LiveLog -and $Script:LogSpinnerActive -and [string]::IsNullOrWhiteSpace($line)) {
-            return
-        }
-
-        if ($LiveLog) {
-            Append-Log $line
-        }
-    }
-
-    $newReadState = {
-        [pscustomobject]@{
-            Buffer = New-Object System.Text.StringBuilder
-            PendingCr = $false
-            PendingCrLine = ''
-        }
-    }
-
-    $processOutputText = {
-        param(
-            [object]$State,
-            [string]$Text
-        )
-
-        if ([string]::IsNullOrEmpty($Text)) {
-            return
-        }
-
-        for ($index = 0; $index -lt $Text.Length; $index++) {
-            $ch = $Text[$index]
-
-            if ($State.PendingCr) {
-                if ($ch -eq $lf) {
-                    & $processOutputLine $State.PendingCrLine $false
-                    $State.PendingCr = $false
-                    $State.PendingCrLine = ''
-                    continue
+                $delayCompleted = Invoke-MockWingetDelay -Milliseconds 300 -OnPulse $mockPulseCallback -CancellationState $Script:CancellationState
+                if ($delayCompleted) {
+                    Update-LogLiveLine -Progress "100%"
                 }
-
-                & $processOutputLine $State.PendingCrLine $true
-                $State.PendingCr = $false
-                $State.PendingCrLine = ''
             }
 
-            if ($ch -eq $cr) {
-                $State.PendingCrLine = $State.Buffer.ToString()
-                [void]$State.Buffer.Clear()
-                $State.PendingCr = $true
-                continue
+            if ($delayCompleted -and $null -ne $pkg -and $pkg.ExitCode -ne 0) {
+                $standardError = 'Error'
+                $exitCode = [int]$pkg.ExitCode
             }
-
-            if ($ch -eq $lf) {
-                & $processOutputLine $State.Buffer.ToString() $false
-                [void]$State.Buffer.Clear()
-                continue
+            elseif ($delayCompleted -and $null -ne $pkg -and -not $pkg.Ghost) {
+                if (-not (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)) {
+                    $pkg.Current = $pkg.Available
+                    if (-not (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)) {
+                        Write-WingetUpdaterJson -Path $Script:MockFile -Data $mock
+                        $standardOutput = 'Success'
+                    }
+                }
             }
+            elseif ($delayCompleted -and $null -ne $pkg) {
+                $standardOutput = 'Success'
+            }
+        }
 
-            [void]$State.Buffer.Append($ch)
+        $mockCancelled = Test-WingetUpdaterCancellationRequested -State $Script:CancellationState
+        $mockExitCode = if ($mockCancelled) { $null } else { $exitCode }
+        $mockResult = New-MockWingetResult `
+            -Arguments $Arguments `
+            -StandardOutput $standardOutput `
+            -StandardError $standardError `
+            -ExitCode $mockExitCode `
+            -Package $Package `
+            -Cancelled $mockCancelled
+        Assert-WingetCleanupGuaranteed -Result $mockResult
+        if ($LiveLog) {
+            if (-not [string]::IsNullOrWhiteSpace($mockResult.CombinedOutput)) {
+                Append-Log $mockResult.CombinedOutput
+            }
+            Append-Log "Log: $($mockResult.LogPath)"
+        }
+        return $mockResult
+        }
+        finally {
+            if ($mockSpinnerStarted) {
+                Stop-Spinner
+            }
         }
     }
 
-    $flushOutputState = {
-        param([object]$State)
-
-        if ($State.PendingCr) {
-            & $processOutputLine $State.PendingCrLine $true
-            $State.PendingCr = $false
-            $State.PendingCrLine = ''
+    if ([string]::IsNullOrWhiteSpace($ApplicationPath)) {
+        if ($null -eq $Script:WingetInfo -or [string]::IsNullOrWhiteSpace([string]$Script:WingetInfo.Path)) {
+            throw 'The absolute winget Application path has not been initialized.'
         }
+        $ApplicationPath = [string]$Script:WingetInfo.Path
+    }
 
-        if ($State.Buffer.Length -gt 0) {
-            & $processOutputLine $State.Buffer.ToString() $false
-            [void]$State.Buffer.Clear()
+    $displayCallback = $null
+    $pulseCallback = $null
+    if ($LiveLog) {
+        Start-Spinner
+        $displayCallback = {
+            param($streamName, $text)
+
+            $displayText = ConvertTo-PlainText -Text $text
+            if (-not [string]::IsNullOrWhiteSpace($displayText)) {
+                if ($streamName -eq 'stderr') {
+                    Append-Log "STDERR: $displayText"
+                }
+                else {
+                    Append-Log $displayText
+                }
+            }
+        }
+        $pulseCallback = {
+            Invoke-WingetUiHeartbeat
         }
     }
 
     try {
+        $Script:CurrentWingetProcess = $true
+        $result = Invoke-WingetProcess -ApplicationPath $ApplicationPath -Arguments $Arguments -LogsDirectory $Script:Paths.LogsDirectory -Package $Package -OnOutput $displayCallback -OnPulse $pulseCallback -CancellationState $Script:CancellationState
+        Assert-WingetCleanupGuaranteed -Result $result
         if ($LiveLog) {
-            Start-Spinner
+            Append-Log "Log: $($result.LogPath)"
         }
-
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = 'winget'
-        $psi.Arguments = Join-CommandLineArguments -Arguments $Arguments
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.CreateNoWindow = $true
-
-        try {
-            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-        }
-        catch {
-            Write-Verbose "Runtime ignored explicit stream encoding: $($_.Exception.Message)"
-        }
-
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $psi
-
-        [void]$process.Start()
-
-        $stdoutDone = $false
-        $stderrDone = $false
-        $stdoutState = & $newReadState
-        $stderrState = & $newReadState
-        $stdoutChars = New-Object 'char[]' 2048
-        $stderrChars = New-Object 'char[]' 2048
-        $stdoutTask = $process.StandardOutput.ReadAsync($stdoutChars, 0, $stdoutChars.Length)
-        $stderrTask = $process.StandardError.ReadAsync($stderrChars, 0, $stderrChars.Length)
-
-        while (-not ($stdoutDone -and $stderrDone)) {
-            if (-not $stdoutDone -and $stdoutTask.IsCompleted) {
-                try {
-                    $read = [int]$stdoutTask.Result
-                    if ($read -le 0) {
-                        $stdoutDone = $true
-                    }
-                    else {
-                        $text = [string]::new($stdoutChars, 0, $read)
-                        & $processOutputText $stdoutState $text
-                        $stdoutTask = $process.StandardOutput.ReadAsync($stdoutChars, 0, $stdoutChars.Length)
-                    }
-                }
-                catch {
-                    & $processOutputLine $_.Exception.Message $false
-                    $stdoutDone = $true
-                }
-            }
-
-            if (-not $stderrDone -and $stderrTask.IsCompleted) {
-                try {
-                    $read = [int]$stderrTask.Result
-                    if ($read -le 0) {
-                        $stderrDone = $true
-                    }
-                    else {
-                        $text = [string]::new($stderrChars, 0, $read)
-                        & $processOutputText $stderrState $text
-                        $stderrTask = $process.StandardError.ReadAsync($stderrChars, 0, $stderrChars.Length)
-                    }
-                }
-                catch {
-                    & $processOutputLine $_.Exception.Message $false
-                    $stderrDone = $true
-                }
-            }
-
-            Start-Sleep -Milliseconds 35
-            if ($LiveLog) {
-                Step-Spinner
-            }
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-
-        & $flushOutputState $stdoutState
-        & $flushOutputState $stderrState
-        $process.WaitForExit()
-        $exitCode = $process.ExitCode
-    }
-    catch {
-        [void]$outputBuilder.AppendLine($_.Exception.Message)
-        if ($LiveLog) {
-            Append-Log $_.Exception.Message
-        }
-        $exitCode = 9999
+        return $result
     }
     finally {
-        if ($null -ne $process) {
-            $process.Dispose()
-        }
+        $Script:CurrentWingetProcess = $null
         if ($LiveLog) {
             Stop-Spinner
         }
-    }
-
-    return [pscustomobject]@{
-        Output = $outputBuilder.ToString()
-        ExitCode = $exitCode
     }
 }
 
 function Initialize-WingetInfo {
     $usingMock = ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked)
-    $command = Get-Command winget -ErrorAction SilentlyContinue
-    if ($null -eq $command -and -not $usingMock) {
-        throw 'Nie znaleziono winget w PATH.'
+    if ($usingMock) {
+        $wingetPath = 'mock-winget'
+    }
+    else {
+        $localAppDataPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+        $commands = @(Get-Command winget -CommandType Application -All -ErrorAction SilentlyContinue)
+        $wingetPath = Resolve-WingetApplicationPath -Commands $commands -LocalAppDataPath $localAppDataPath
     }
 
-    $versionResult = Invoke-Winget -Arguments @('--version')
-    $helpResult = Invoke-Winget -Arguments @('upgrade', '--help')
-    $versionText = (ConvertTo-PlainText $versionResult.Output).Trim()
-    $helpText = ConvertTo-PlainText $helpResult.Output
+    $versionResult = Invoke-Winget -ApplicationPath $wingetPath -Arguments @('--version')
+    $helpResult = Invoke-Winget -ApplicationPath $wingetPath -Arguments @('upgrade', '--help')
+    if (-not $versionResult.Started -or -not [string]::IsNullOrWhiteSpace($versionResult.InfrastructureError)) {
+        throw "Nie udalo sie uruchomic winget --version: $($versionResult.InfrastructureError)"
+    }
+    if (-not $helpResult.Started -or -not [string]::IsNullOrWhiteSpace($helpResult.InfrastructureError)) {
+        throw "Nie udalo sie uruchomic winget upgrade --help: $($helpResult.InfrastructureError)"
+    }
+    $versionText = (ConvertTo-PlainText $versionResult.StandardOutput).Trim()
+    $helpText = ConvertTo-PlainText $helpResult.StandardOutput
     $version = ConvertTo-WingetVersion -Text $versionText
     $warnings = New-Object System.Collections.Generic.List[string]
 
@@ -999,13 +830,13 @@ function Initialize-WingetInfo {
     }
 
     $supportsIncludeUnknown = (Test-WingetHelpOption -HelpText $helpText -Option '--include-unknown') -or (Test-WingetHelpOption -HelpText $helpText -Option '--unknown')
-    $wingetPath = if ($usingMock) { 'mock-winget' } else { [string]$command.Source }
 
     $Script:WingetInfo = [pscustomobject]@{
         Path = $wingetPath
         VersionText = $versionText
         Version = $version
         SupportsAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
+        SupportsSourceUpdateAcceptSourceAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-source-agreements'
         SupportsAcceptPackageAgreements = Test-WingetHelpOption -HelpText $helpText -Option '--accept-package-agreements'
         SupportsDisableInteractivity = Test-WingetHelpOption -HelpText $helpText -Option '--disable-interactivity'
         SupportsIncludeUnknown = $supportsIncludeUnknown
@@ -1019,7 +850,7 @@ function Initialize-WingetInfo {
 
 function Sync-WingetUiCapabilities {
     if ($null -ne $Script:IncludeUnknownCheck -and $null -ne $Script:WingetInfo) {
-        $Script:IncludeUnknownCheck.Enabled = [bool]($Script:WingetInfo.SupportsIncludeUnknown)
+        $Script:IncludeUnknownCheck.Enabled = -not $Script:IsBusy -and [bool]($Script:WingetInfo.SupportsIncludeUnknown)
         if (-not [bool]($Script:WingetInfo.SupportsIncludeUnknown)) {
             $Script:IncludeUnknownCheck.Checked = $false
         }
@@ -1027,60 +858,25 @@ function Sync-WingetUiCapabilities {
 }
 
 function New-WingetUpgradeListArguments {
-    $arguments = @('upgrade')
-
-    if ($null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsAcceptSourceAgreements)) {
-        $arguments += '--accept-source-agreements'
-    }
-    if ($null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsDisableInteractivity)) {
-        $arguments += '--disable-interactivity'
-    }
-    if ($null -ne $Script:IncludeUnknownCheck -and $Script:IncludeUnknownCheck.Checked -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsIncludeUnknown)) {
-        $arguments += '--include-unknown'
-    }
-
-    return $arguments
-}
-
-function New-WingetPackageUpgradeArguments {
-    param(
-        [string]$Id,
-        [string]$Source
-    )
-
-    $arguments = @('upgrade', '--id', $Id)
-
-    if ($null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsAcceptPackageAgreements)) {
-        $arguments += '--accept-package-agreements'
-    }
-    if ($null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsAcceptSourceAgreements)) {
-        $arguments += '--accept-source-agreements'
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Source) -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsSource)) {
-        $arguments += @('--source', $Source)
-    }
-
-    if ($null -ne $Script:InteractiveCheck -and $Script:InteractiveCheck.Checked -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsInteractive)) {
-        $arguments += '--interactive'
-    }
-    elseif ($null -ne $Script:SilentCheck -and $Script:SilentCheck.Checked -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsSilent)) {
-        $arguments += '--silent'
-    }
-
-    if ($null -ne $Script:IncludeUnknownCheck -and $Script:IncludeUnknownCheck.Checked -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsIncludeUnknown)) {
-        $arguments += '--include-unknown'
-    }
-
-    return $arguments
+    return @(WingetUpdater.Core\New-WingetUpgradeListArguments -Capabilities $Script:WingetInfo -SourceAgreementsAccepted $Script:SourceAgreementsAccepted -IncludeUnknown ($null -ne $Script:IncludeUnknownCheck -and $Script:IncludeUnknownCheck.Checked))
 }
 
 function Add-PackageRow {
-    param([pscustomobject]$Package)
+    param(
+        [pscustomobject]$Package,
+        [System.Data.DataTable]$Table = $Script:Packages
+    )
 
     $isSkipped = $Script:SkippedIds.ContainsKey($Package.Id)
-    $isGhost = $Script:AttemptedUpdates.ContainsKey($Package.Id) -and $Script:AttemptedUpdates[$Package.Id] -eq $Package.AvailableVersion
+    $attemptKey = Get-PackageAttemptKey -Id $Package.Id -Source $Package.Source
+    $isGhost = $Script:AttemptedUpdates.ContainsKey($attemptKey) -and $Script:AttemptedUpdates[$attemptKey] -eq $Package.AvailableVersion
 
-    $row = $Script:Packages.NewRow()
+    if ($isGhost) {
+        $storedResult = if ($Script:SuccessfulAttemptResults.ContainsKey($attemptKey)) { $Script:SuccessfulAttemptResults[$attemptKey] } else { $null }
+        Add-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Package $Package -Result $storedResult -FailureType 'PostVerificationFailure'
+    }
+
+    $row = $Table.NewRow()
     Set-RowValue -Row $row -ColumnName 'Update' -Value (-not $isSkipped -and -not $isGhost)
     Set-RowValue -Row $row -ColumnName 'Skip' -Value $isSkipped
     Set-RowValue -Row $row -ColumnName 'Name' -Value $Package.Name
@@ -1104,7 +900,7 @@ function Add-PackageRow {
     }
     Set-RowValue -Row $row -ColumnName 'Status' -Value $status
 
-    [void]$Script:Packages.Rows.Add($row)
+    [void]$Table.Rows.Add($row)
 }
 
 function Commit-GridEdits {
@@ -1114,9 +910,16 @@ function Commit-GridEdits {
 }
 
 function Save-SkipList {
-    param([switch]$Silent)
+    param(
+        [switch]$Silent,
+        [switch]$BypassBusyGuard
+    )
 
-    Commit-GridEdits
+    if ($Script:IsBusy -and -not $BypassBusyGuard) {
+        return $false
+    }
+
+    [void](Commit-GridEdits)
 
     $merged = @{}
     foreach ($key in $Script:SkippedIds.Keys) {
@@ -1138,12 +941,7 @@ function Save-SkipList {
     }
 
     $ids = @($merged.Keys | Sort-Object)
-    $data = [ordered]@{
-        skippedIds = $ids
-        updatedAt = (Get-Date).ToString('o')
-    }
-
-    $data | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Script:SkipFile -Encoding UTF8
+    [void](Write-WingetUpdaterSkipList -Path $Script:SkipFile -SkippedIds $ids)
 
     $Script:SkippedIds = @{}
     foreach ($id in $ids) {
@@ -1158,6 +956,22 @@ function Save-SkipList {
             [System.Windows.Forms.MessageBoxIcon]::Information
         ) | Out-Null
     }
+    return $true
+}
+
+function Limit-LogBoxBuffer {
+    if ($null -eq $Script:LogBox -or $Script:LogBox.TextLength -le $Script:MaxLogBoxCharacters) {
+        return
+    }
+
+    $charactersToRemove = $Script:LogBox.TextLength - $Script:MaxLogBoxCharacters
+    $lineEnd = $Script:LogBox.Text.IndexOf("`n", $charactersToRemove)
+    if ($lineEnd -ge 0) {
+        $charactersToRemove = $lineEnd + 1
+    }
+    $Script:LogBox.Select(0, $charactersToRemove)
+    $Script:LogBox.SelectedText = ''
+    Reset-LogLiveLine
 }
 
 function Append-Log {
@@ -1173,6 +987,7 @@ function Append-Log {
     if (-not $cleanText.EndsWith("`r`n")) {
         $Script:LogBox.AppendText("`r`n")
     }
+    Limit-LogBoxBuffer
     $Script:LogBox.SelectionStart = $Script:LogBox.TextLength
     $Script:LogBox.ScrollToCaret()
 }
@@ -1213,6 +1028,25 @@ function Set-Busy {
         [string]$Message
     )
 
+    $Script:IsBusy = $Busy
+    Set-WingetUpdaterBusyControlState -Busy $Busy -OperationControls @(
+        $Script:RefreshButton,
+        $Script:UpdateButton,
+        $Script:SaveButton,
+        $Script:LoadSkippedButton,
+        $Script:UpdateAllButton,
+        $Script:UpdateNoneButton,
+        $Script:SkipAllButton,
+        $Script:SkipNoneButton,
+        $Script:CopyMessageButton,
+        $Script:OpenAiCliButton,
+        $Script:AgentCombo,
+        $Script:TestModeCheck,
+        $Script:SilentCheck,
+        $Script:InteractiveCheck,
+        $Script:IncludeUnknownCheck,
+        $Script:Grid
+    ) -CancelControl $Script:CancelButton
     $Script:RefreshButton.Enabled = -not $Busy
     $Script:UpdateButton.Enabled = -not $Busy
     $Script:SaveButton.Enabled = -not $Busy
@@ -1231,22 +1065,34 @@ function Set-Busy {
     if ($null -ne $Script:SkipNoneButton) {
         $Script:SkipNoneButton.Enabled = -not $Busy
     }
-    if ($null -ne $Script:RepairButton) {
-        $Script:RepairButton.Enabled = -not $Busy
+    if ($null -ne $Script:CopyMessageButton) {
+        $Script:CopyMessageButton.Enabled = -not $Busy
     }
-    if ($null -ne $Script:SourceUpdateButton) {
-        $Script:SourceUpdateButton.Enabled = -not $Busy
-    }
-    if ($null -ne $Script:SourceUpdateCheck) {
-        $Script:SourceUpdateCheck.Enabled = -not $Busy
-    }
-    if ($null -ne $Script:TerminalCombo) {
-        $Script:TerminalCombo.Enabled = -not $Busy
+    if ($null -ne $Script:OpenAiCliButton) {
+        $Script:OpenAiCliButton.Enabled = -not $Busy
     }
     if ($null -ne $Script:AgentCombo) {
         $Script:AgentCombo.Enabled = -not $Busy
     }
-    $Script:Grid.Enabled = -not $Busy
+    if ($null -ne $Script:TestModeCheck) {
+        $Script:TestModeCheck.Enabled = -not $Busy
+    }
+    if ($null -ne $Script:SilentCheck) {
+        $Script:SilentCheck.Enabled = -not $Busy
+    }
+    if ($null -ne $Script:InteractiveCheck) {
+        $Script:InteractiveCheck.Enabled = -not $Busy
+    }
+    if ($null -ne $Script:IncludeUnknownCheck) {
+        $Script:IncludeUnknownCheck.Enabled = -not $Busy
+    }
+    if ($null -ne $Script:Grid) {
+        $Script:Grid.Enabled = -not $Busy
+    }
+    if ($null -ne $Script:CancelButton) {
+        $Script:CancelButton.Enabled = $Busy
+        $Script:CancelButton.Visible = $Busy
+    }
     $Script:Form.Cursor = if ($Busy) {
         [System.Windows.Forms.Cursors]::WaitCursor
     }
@@ -1256,16 +1102,98 @@ function Set-Busy {
     $Script:StatusLabel.Text = $Message
     if (-not $Busy) {
         Stop-Spinner
+        Sync-WingetUiCapabilities
     }
-    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Test-ShouldCancelFormClose {
+    return [bool]$Script:IsBusy
+}
+
+function Test-OperationEntryAllowed {
+    return (-not [bool]$Script:IsBusy)
+}
+
+function Confirm-SourceAgreements {
+    if ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked) {
+        return $true
+    }
+    if ($Script:SourceAgreementsAccepted) {
+        return $true
+    }
+
+    $promptAction = {
+        $message = "Pelny dostep do winget wymaga zgody na umowy metadanych zrodel.`r`n`r`nOpcja --accept-source-agreements pozwala zaakceptowac te umowy przed pobraniem metadanych.`r`n`r`nOdmowa pozostawi GUI otwarte, z dostepnym trybem Mock. Pelny dostep wymaga ponownego uzycia Odswiez."
+        $choice = [System.Windows.Forms.MessageBox]::Show(
+            $message,
+            'Zgoda na umowy zrodel',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return ($choice -eq [System.Windows.Forms.DialogResult]::Yes)
+    }.GetNewClosure()
+    $persistAction = {
+        Grant-WingetUpdaterSourceAgreements -Path $Script:Paths.SettingsFile | Out-Null
+        $Script:SourceAgreementsAccepted = $true
+    }.GetNewClosure()
+    $decision = Resolve-WingetUpdaterSourceAgreementConsent `
+        -MockMode $false `
+        -AlreadyAccepted $Script:SourceAgreementsAccepted `
+        -PromptAction $promptAction `
+        -PersistAcceptanceAction $persistAction
+    if (-not $decision.Allowed) {
+        if ($null -ne $Script:StatusLabel) {
+            $Script:StatusLabel.Text = 'Odmowa umow zrodel. Pelny dostep wymaga ponownego uzycia Odswiez; tryb Mock pozostaje dostepny.'
+        }
+        return $false
+    }
+    return $true
+}
+
+function Confirm-OperationCancellation {
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+        'Biezaca operacja moze uruchomic niezalezny instalator lub podniesiony instalator. Anulowanie zatrzyma proces winget, ale taki instalator moze jeszcze wymagac osobnego zamkniecia.',
+        'Anuluj operacje',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
+        Request-WingetUpdaterCancellation -State $Script:CancellationState
+        return $true
+    }
+    return $false
+}
+
+function Complete-Operation {
+    param([string]$Message)
+
+    Set-Busy -Busy $false -Message $Message
+    if ($Script:ClosePending) {
+        $Script:ClosePending = $false
+        if ($null -ne $Script:Form) {
+            [void]$Script:Form.BeginInvoke([Action]{ $Script:Form.Close() })
+        }
+    }
 }
 
 function Invoke-WingetSourceUpdate {
     param([switch]$ContinueOnError)
 
-    $arguments = @('source', 'update')
-    Append-Log "> winget $($arguments -join ' ')"
+    $arguments = @(New-WingetSourceUpdateArguments -Capabilities $Script:WingetInfo -SourceAgreementsAccepted $Script:SourceAgreementsAccepted)
     $result = Invoke-Winget -Arguments $arguments -LiveLog
+
+    if ($result.Cancelled) {
+        return $result
+    }
+
+    if (-not $result.Started -or -not [string]::IsNullOrWhiteSpace($result.InfrastructureError)) {
+        $message = "winget source update nie zostal poprawnie uruchomiony: $($result.InfrastructureError)"
+        if ($ContinueOnError) {
+            Append-Log "UWAGA: $message Kontynuuje sprawdzanie aktualizacji."
+            return $result
+        }
+        throw $message
+    }
 
     if ($result.ExitCode -ne 0) {
         $message = "winget source update zakonczyl sie kodem $($result.ExitCode)."
@@ -1280,44 +1208,25 @@ function Invoke-WingetSourceUpdate {
     return $result
 }
 
-function Update-WingetSources {
-    Save-SkipList -Silent
-    Set-Busy -Busy $true -Message 'Odswiezanie bazy winget...'
-
-    try {
-        Initialize-WingetInfo
-        Sync-WingetUiCapabilities
-        Append-Log "Runtime: $(Get-PowerShellRuntimeText)"
-        Append-Log "winget: $($Script:WingetInfo.VersionText) ($($Script:WingetInfo.Path))"
-        Invoke-WingetSourceUpdate | Out-Null
-        $Script:StatusLabel.Text = 'Baza winget odswiezona.'
-        Refresh-Packages -PreserveLog
-    }
-    catch {
-        Append-Log $_.Exception.Message
-        [System.Windows.Forms.MessageBox]::Show(
-            $_.Exception.Message,
-            'Blad podczas odswiezania bazy winget',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-    }
-    finally {
-        Set-Busy -Busy $false -Message $Script:StatusLabel.Text
-    }
-}
-
 function Refresh-Packages {
-    param([switch]$PreserveLog)
+    param([switch]$PreserveLog, [switch]$ListOnly, [switch]$KeepBusy)
 
-    Save-SkipList -Silent
-    Set-Busy -Busy $true -Message 'Sprawdzanie aktualizacji winget...'
+    if (-not (Test-OperationEntryAllowed) -and -not $KeepBusy) {
+        return
+    }
+    if (-not (Confirm-SourceAgreements)) {
+        return
+    }
+    Save-SkipList -Silent -BypassBusyGuard
+    if (-not $KeepBusy) {
+        Set-Busy -Busy $true -Message 'Sprawdzanie aktualizacji winget...'
+        $Script:CancellationState = New-WingetUpdaterCancellationState
+    }
 
     try {
-        $Script:Packages.Clear()
         if ($PreserveLog) {
             Append-Log ''
-            Append-Log '--- Odswiezanie listy po aktualizacji ---'
+            Append-Log '--- Odswiezanie listy ---'
         }
         else {
             $Script:LogBox.Clear()
@@ -1333,22 +1242,45 @@ function Refresh-Packages {
             Append-Log "UWAGA: $warning"
         }
 
-        if ($null -ne $Script:SourceUpdateCheck -and $Script:SourceUpdateCheck.Checked) {
+        $sourceUpdateWarning = ''
+        if (-not $ListOnly) {
             $Script:StatusLabel.Text = 'Odswiezanie bazy winget...'
-            Invoke-WingetSourceUpdate -ContinueOnError | Out-Null
+            $sourceResult = Invoke-WingetSourceUpdate -ContinueOnError
+            if ($sourceResult.Cancelled) {
+                $Script:StatusLabel.Text = 'Anulowano.'
+                return
+            }
+            if (-not $sourceResult.Started -or -not [string]::IsNullOrWhiteSpace($sourceResult.InfrastructureError)) {
+                $sourceUpdateWarning = "Odswiezenie zrodel nie zostalo uruchomione: $($sourceResult.InfrastructureError) Lista zostala sprawdzona mimo bledu."
+            }
+            elseif ($sourceResult.ExitCode -ne 0) {
+                $sourceUpdateWarning = "Odswiezenie zrodel nie powiodlo sie (kod $($sourceResult.ExitCode)); lista zostala sprawdzona mimo bledu."
+            }
             $Script:StatusLabel.Text = 'Sprawdzanie aktualizacji winget...'
         }
 
         $arguments = @(New-WingetUpgradeListArguments)
-        Append-Log "> winget $($arguments -join ' ')"
         $result = Invoke-Winget -Arguments $arguments -LiveLog
-
-        $packages = @(Parse-WingetUpgradeOutput -Output $result.Output)
+        if ($result.Cancelled) {
+            $Script:StatusLabel.Text = 'Anulowano.'
+            return
+        }
+        if (-not $result.Started) {
+            throw "winget upgrade nie zostal uruchomiony: $($result.InfrastructureError)"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($result.InfrastructureError)) {
+            throw "winget upgrade zakonczyl sie bledem infrastruktury: $($result.InfrastructureError)"
+        }
+        $packages = @(ConvertFrom-WingetUpgradeResult -ExitCode $result.ExitCode -StandardOutput $result.StandardOutput)
+        $newPackages = New-PackagesTable
         foreach ($package in $packages) {
-            Add-PackageRow -Package $package
+            Add-PackageRow -Package $package -Table $newPackages
         }
 
+        $Script:Packages = $newPackages
+
         if ($null -ne $Script:Grid) {
+            $Script:Grid.DataSource = $Script:Packages
             foreach ($gridRow in $Script:Grid.Rows) {
                 $isGhostRow = Test-IsGhostPackageRow -Row $gridRow
                 $gridRow.Cells['Update'].ReadOnly = $isGhostRow
@@ -1362,6 +1294,7 @@ function Refresh-Packages {
                     $gridRow.Cells['Update'].Value = $false
                 }
             }
+            $Script:Grid.ClearSelection()
         }
 
         $skippedVisible = 0
@@ -1375,11 +1308,19 @@ function Refresh-Packages {
             }
         }
 
+        $listStatus = ''
         if ($packages.Count -eq 0) {
-            $Script:StatusLabel.Text = 'Brak dostepnych aktualizacji albo winget nie zwrocil tabeli pakietow.'
+            $listStatus = 'Brak dostepnych aktualizacji albo winget nie zwrocil tabeli pakietow.'
         }
         else {
-            $Script:StatusLabel.Text = "Znaleziono aktualizacje: $($packages.Count). Unknown: $unknownVisible. Pominiete: $skippedVisible."
+            $listStatus = "Znaleziono aktualizacje: $($packages.Count). Unknown: $unknownVisible. Pominiete: $skippedVisible."
+        }
+        if ([string]::IsNullOrWhiteSpace($sourceUpdateWarning)) {
+            $Script:StatusLabel.Text = $listStatus
+        }
+        else {
+            Append-Log "UWAGA: $sourceUpdateWarning"
+            $Script:StatusLabel.Text = "UWAGA: $sourceUpdateWarning $listStatus"
         }
     }
     catch {
@@ -1392,7 +1333,10 @@ function Refresh-Packages {
         ) | Out-Null
     }
     finally {
-        Set-Busy -Busy $false -Message $Script:StatusLabel.Text
+        if (-not $KeepBusy) {
+            Set-Busy -Busy $false -Message $Script:StatusLabel.Text
+            Complete-Operation -Message $Script:StatusLabel.Text
+        }
     }
 }
 
@@ -1434,10 +1378,15 @@ function Set-AllPackageSelection {
     param(
         [ValidateSet('Update', 'Skip')]
         [string]$ColumnName,
-        [bool]$Checked
+        [bool]$Checked,
+        [switch]$BypassBusyGuard
     )
 
-    Commit-GridEdits
+    if ($Script:IsBusy -and -not $BypassBusyGuard) {
+        return $false
+    }
+
+    [void](Commit-GridEdits)
 
     foreach ($row in $Script:Packages.Rows) {
         if (-not ($row -is [System.Data.DataRow])) {
@@ -1446,29 +1395,29 @@ function Set-AllPackageSelection {
 
         if ($ColumnName -eq 'Update') {
             if (Test-IsGhostPackageRow -Row $row) {
-                Set-RowValue -Row $row -ColumnName 'Update' -Value $false
+                [void](Set-RowValue -Row $row -ColumnName 'Update' -Value $false)
                 if (-not [bool](Get-RowValue -Row $row -ColumnName 'Skip')) {
-                    Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
+                    [void](Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)')
                 }
                 continue
             }
             if ($Checked -and [bool](Get-RowValue -Row $row -ColumnName 'Skip')) {
                 continue
             }
-            Set-RowValue -Row $row -ColumnName 'Update' -Value $Checked
+            [void](Set-RowValue -Row $row -ColumnName 'Update' -Value $Checked)
         }
         else {
-            Set-RowValue -Row $row -ColumnName 'Skip' -Value $Checked
+            [void](Set-RowValue -Row $row -ColumnName 'Skip' -Value $Checked)
             if ($Checked) {
-                Set-RowValue -Row $row -ColumnName 'Update' -Value $false
-                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Pominiete'
+                [void](Set-RowValue -Row $row -ColumnName 'Update' -Value $false)
+                [void](Set-RowValue -Row $row -ColumnName 'Status' -Value 'Pominiete')
             }
             elseif (Test-IsGhostPackageRow -Row $row) {
-                Set-RowValue -Row $row -ColumnName 'Update' -Value $false
-                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
+                [void](Set-RowValue -Row $row -ColumnName 'Update' -Value $false)
+                [void](Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)')
             }
             elseif ([string](Get-RowValue -Row $row -ColumnName 'Status') -eq 'Pominiete') {
-                Set-RowValue -Row $row -ColumnName 'Status' -Value ''
+                [void](Set-RowValue -Row $row -ColumnName 'Status' -Value '')
             }
         }
     }
@@ -1476,13 +1425,21 @@ function Set-AllPackageSelection {
     if ($null -ne $Script:Grid) {
         [void]$Script:Grid.Refresh()
     }
+    return $true
 }
 
 function Apply-SkipListToVisiblePackages {
-    param([switch]$Silent)
+    param(
+        [switch]$Silent,
+        [switch]$BypassBusyGuard
+    )
 
-    Commit-GridEdits
-    Load-SkipList
+    if ($Script:IsBusy -and -not $BypassBusyGuard) {
+        return $false
+    }
+
+    [void](Commit-GridEdits)
+    [void](Load-SkipList)
 
     $matched = 0
     foreach ($row in $Script:Packages.Rows) {
@@ -1493,18 +1450,18 @@ function Apply-SkipListToVisiblePackages {
         $id = ([string](Get-RowValue -Row $row -ColumnName 'Id')).Trim()
         $isSkipped = $id.Length -gt 0 -and $Script:SkippedIds.ContainsKey($id)
 
-        Set-RowValue -Row $row -ColumnName 'Skip' -Value $isSkipped
+        [void](Set-RowValue -Row $row -ColumnName 'Skip' -Value $isSkipped)
         if ($isSkipped) {
-            Set-RowValue -Row $row -ColumnName 'Update' -Value $false
-            Set-RowValue -Row $row -ColumnName 'Status' -Value 'Pominiete'
+            [void](Set-RowValue -Row $row -ColumnName 'Update' -Value $false)
+            [void](Set-RowValue -Row $row -ColumnName 'Status' -Value 'Pominiete')
             $matched++
         }
         elseif (Test-IsGhostPackageRow -Row $row) {
-            Set-RowValue -Row $row -ColumnName 'Update' -Value $false
-            Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)'
+            [void](Set-RowValue -Row $row -ColumnName 'Update' -Value $false)
+            [void](Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad (Ghost)')
         }
         elseif ([string](Get-RowValue -Row $row -ColumnName 'Status') -eq 'Pominiete') {
-            Set-RowValue -Row $row -ColumnName 'Status' -Value ''
+            [void](Set-RowValue -Row $row -ColumnName 'Status' -Value '')
         }
     }
 
@@ -1526,6 +1483,7 @@ function Apply-SkipListToVisiblePackages {
             [System.Windows.Forms.MessageBoxIcon]::Information
         ) | Out-Null
     }
+    return $true
 }
 
 function Confirm-UpdateRows {
@@ -1548,7 +1506,7 @@ function Confirm-UpdateRows {
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 46)))
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = "Zostana zaktualizowane wszystkie ponizsze pakiety: $($Rows.Count)"
+    $label.Text = "Zostana zaktualizowane wszystkie ponizsze pakiety: $($Rows.Count). Kontynuujac, akceptujesz umowy pakietow dla tych instalatorow."
     $label.Dock = 'Fill'
     $label.TextAlign = 'MiddleLeft'
 
@@ -1612,218 +1570,10 @@ function Confirm-UpdateRows {
     }
 }
 
-function Get-WingetPackageScope {
-    param(
-        [string]$Id,
-        [string]$Source
-    )
-
-    $arguments = @('show', '--id', $Id)
-    if ($null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsAcceptSourceAgreements)) {
-        $arguments += '--accept-source-agreements'
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Source) -and $null -ne $Script:WingetInfo -and [bool]($Script:WingetInfo.SupportsSource)) {
-        $arguments += @('--source', $Source)
-    }
-
-    $result = Invoke-Winget -Arguments $arguments -LiveLog:$false
-    if ($result.ExitCode -ne 0) {
-        return 'Unknown'
-    }
-
-    $lines = $result.Output -split "`r?`n"
-    foreach ($line in $lines) {
-        if ($line -match '^\s*Zakres(?: instalatora)?\s*:\s*(User|Machine|Uzytkownik|Maszyna|MachineOrUser)\s*$' -or $line -match '^\s*Installer(?: )?Scope\s*:\s*(User|Machine|MachineOrUser)\s*$') {
-            $scope = $matches[1]
-            if ($scope -match 'User|Uzytkownik') { return 'User' }
-            if ($scope -match 'Machine|Maszyna') { return 'Machine' }
-            return 'Unknown'
-        }
-    }
-    return 'Unknown'
-}
-
-function Invoke-WingetElevated {
-    param(
-        [string[]]$Arguments
-    )
-
-    # --- POCZĄTEK: PRZECHWYCENIE WINGET ELEVATED DLA TRYBU TESTOWEGO ---
-    if ($null -ne $Script:TestModeCheck -and $Script:TestModeCheck.Checked) {
-        if ($Arguments -contains 'upgrade' -and $Arguments -contains '--id') {
-            $idIdx = [array]::IndexOf($Arguments, '--id') + 1
-            $id = $Arguments[$idIdx]
-
-            $mock = Get-Content -LiteralPath $Script:MockFile -Raw | ConvertFrom-Json
-            $pkg = $mock.$id
-            if ($null -eq $pkg) {
-                Append-Log "[MOCK UAC] Nie znaleziono pakietu: $id"
-                return 1
-            }
-
-            Append-Log "[MOCK UAC] Proba aktualizacji $id z uprawnieniami..."
-            Start-Spinner
-            for ($i=0; $i -lt 10; $i++) {
-                Step-Spinner
-                Update-LogLiveLine -Progress "$($i*10)% Pobieranie..."
-                Start-Sleep -Milliseconds 150
-                [System.Windows.Forms.Application]::DoEvents()
-            }
-            Stop-Spinner
-
-            if ($pkg.AdminExitCode -ne 0) {
-                Append-Log "[MOCK UAC] Odmowa instalatora (zwrocono blad $($pkg.AdminExitCode))."
-                return $pkg.AdminExitCode
-            }
-            if (-not $pkg.Ghost) {
-                $pkg.Current = $pkg.Available
-                $mock | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Script:MockFile -Encoding UTF8
-            }
-            Append-Log "[MOCK UAC] Zainstalowano."
-            return 0
-        }
-    }
-    # --- KONIEC: PRZECHWYCENIE WINGET ELEVATED DLA TRYBU TESTOWEGO ---
-
-    $tempLog = Join-Path $env:TEMP "WingetElevated_$([guid]::NewGuid().ToString().Substring(0,8)).log"
-
-    # Przekazanie złączonych argumentów. Argumenty zawierają apostrofy/cudzysłowy,
-    # więc bezpieczniej przekazać je przez Base64.
-    $argsJoined = $Arguments -join ' '
-
-    $scriptBlock = @"
-`$psi = New-Object System.Diagnostics.ProcessStartInfo
-`$psi.FileName = 'winget'
-`$psi.Arguments = '$argsJoined'
-`$psi.RedirectStandardOutput = `$true
-`$psi.RedirectStandardError = `$true
-`$psi.UseShellExecute = `$false
-`$psi.CreateNoWindow = `$true
-`$psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-`$proc = [System.Diagnostics.Process]::Start(`$psi)
-
-`$fs = [System.IO.File]::Open('$tempLog', 'Create', 'Write', 'Read')
-`$writer = New-Object System.IO.StreamWriter(`$fs, [System.Text.Encoding]::UTF8)
-`$writer.AutoFlush = `$true
-
-`$reader = `$proc.StandardOutput
-`$buffer = New-Object System.Text.StringBuilder
-
-while (-not `$proc.HasExited -or -not `$reader.EndOfStream) {
-    `$chInt = `$reader.Read()
-    if (`$chInt -lt 0) { break }
-    `$ch = [char]`$chInt
-
-    if (`$chInt -eq 13 -or `$chInt -eq 8) { # Carriage Return (\r) lub Backspace (\b)
-        if (`$buffer.Length -gt 0) {
-            `$writer.WriteLine("[T]" + `$buffer.ToString())
-            `$buffer.Clear() | Out-Null
-        }
-    } elseif (`$chInt -eq 10) { # Line Feed (\n)
-        `$writer.WriteLine("[L]" + `$buffer.ToString())
-        `$buffer.Clear() | Out-Null
-    } else {
-        `$buffer.Append(`$ch) | Out-Null
-    }
-}
-if (`$buffer.Length -gt 0) {
-    `$writer.WriteLine("[L]" + `$buffer.ToString())
-}
-`$writer.WriteLine("[E]" + `$proc.ExitCode)
-`$writer.Close()
-"@
-
-    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($scriptBlock))
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'powershell.exe'
-    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
-    $psi.UseShellExecute = $true
-    $psi.Verb = 'RunAs'
-    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-
-    $exitCode = -1
-    try {
-        $process = [System.Diagnostics.Process]::Start($psi)
-        Start-Spinner
-
-        $lastPos = 0
-        $chunkBuffer = ""
-        $keepReading = $true
-
-        while ($keepReading) {
-            $hasData = $false
-            if (Test-Path $tempLog) {
-                try {
-                    $fs = [System.IO.File]::Open($tempLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                    $len = $fs.Length
-                    if ($len -gt $lastPos) {
-                        $fs.Position = $lastPos
-                        $bytes = New-Object byte[] ($len - $lastPos)
-                        $fs.Read($bytes, 0, $bytes.Length) | Out-Null
-                        $lastPos = $fs.Position
-                        $chunkBuffer += [System.Text.Encoding]::UTF8.GetString($bytes)
-                        $hasData = $true
-                    }
-                    $fs.Close()
-
-                    if ($hasData) {
-                        while ($chunkBuffer -match "(?s)^(.*?)\r?\n(.*)$") {
-                            $line = $matches[1]
-                            $chunkBuffer = $matches[2]
-
-                            if ($line.StartsWith('[T]')) {
-                                $content = (ConvertTo-PlainText $line.Substring(3)).Trim()
-                                if (Test-IsWingetSpinnerLine -Line $content) {
-                                    Step-Spinner
-                                    Update-LogLiveLine -Spinner $content
-                                } else {
-                                    $prog = Get-WingetProgressText -Line $content
-                                    if ([string]::IsNullOrWhiteSpace($prog)) { $prog = $content }
-                                    Update-LogLiveLine -Progress $prog
-                                }
-                            } elseif ($line.StartsWith('[L]')) {
-                                Append-Log (ConvertTo-PlainText $line.Substring(3))
-                            } elseif ($line.StartsWith('[E]')) {
-                                $exitCode = [int]$line.Substring(3)
-                                $keepReading = $false
-                            }
-                        }
-                    }
-                }
-                catch {
-                    Write-Verbose "Temporary elevated log read failed: $($_.Exception.Message)"
-                }
-            }
-
-            if ($keepReading) {
-                if ($process.HasExited -and -not $hasData) {
-                    $keepReading = $false
-                } else {
-                    Start-Sleep -Milliseconds 50
-                    Step-Spinner
-                    [System.Windows.Forms.Application]::DoEvents()
-                }
-            }
-        }
-    }
-    catch {
-        Append-Log "Odrzucono UAC lub blad: $($_.Exception.Message)"
-        return -1
-    }
-    finally {
-        Stop-Spinner
-        try {
-            Remove-Item -Path $tempLog -Force -ErrorAction SilentlyContinue
-        }
-        catch {
-            Write-Verbose "Temporary elevated log cleanup failed: $($_.Exception.Message)"
-        }
-    }
-    return $exitCode
-}
-
 function Update-SelectedPackages {
+    if (-not (Test-OperationEntryAllowed)) {
+        return
+    }
     $rows = Get-SelectedUpdateRows
     if ($rows.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show(
@@ -1840,93 +1590,80 @@ function Update-SelectedPackages {
     if (-not (Confirm-UpdateRows -Rows $rows)) {
         return
     }
+    if (-not (Confirm-SourceAgreements)) {
+        return
+    }
 
-    Save-SkipList -Silent
-    Set-Busy -Busy $true -Message "Skanowanie uprawnien dla pakietow: $($rows.Count)..."
+    Save-SkipList -Silent -BypassBusyGuard
+    Set-Busy -Busy $true -Message "Aktualizowanie pakietow: $($rows.Count)..."
+    $Script:CancellationState = New-WingetUpdaterCancellationState
 
     try {
         Initialize-WingetInfo
         Sync-WingetUiCapabilities
 
-        foreach ($row in $rows) {
-            Set-RowValue -Row $row -ColumnName 'Status' -Value 'Skanowanie...'
-        }
-        [System.Windows.Forms.Application]::DoEvents()
-
-        $userScopedRows = @()
-        $machineScopedRows = @()
-
         Append-Log ''
-        Append-Log '== Grupowanie pakietow wedlug wymagan uprawnien =='
+        Append-Log "== Aktualizacja wybranych pakietow: $($rows.Count) =="
 
         foreach ($row in $rows) {
+            if (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState) {
+                break
+            }
             $id = [string](Get-RowValue -Row $row -ColumnName 'Id')
             $source = ([string](Get-RowValue -Row $row -ColumnName 'Source')).Trim()
-            $scope = Get-WingetPackageScope -Id $id -Source $source
-
-            if ($scope -eq 'User') {
-                $userScopedRows += $row
-                Append-Log "Pakiet [USER]: $id (Nie wymaga uprawnien Administratora)"
-            } else {
-                $machineScopedRows += $row
-                Append-Log "Pakiet [MACHINE]: $id (Wymaga potwierdzenia UAC)"
+            $package = [pscustomobject]@{
+                Id = $id
+                Name = [string](Get-RowValue -Row $row -ColumnName 'Name')
+                CurrentVersion = [string](Get-RowValue -Row $row -ColumnName 'CurrentVersion')
+                AvailableVersion = [string](Get-RowValue -Row $row -ColumnName 'AvailableVersion')
+                Source = $source
             }
-            [System.Windows.Forms.Application]::DoEvents()
-        }
+            Set-RowValue -Row $row -ColumnName 'Status' -Value 'Aktualizacja...'
 
-        if ($userScopedRows.Count -gt 0) {
-            Append-Log ''
-            Append-Log '========================================'
-            Append-Log "Aktualizacja cicha (User-Scoped): $($userScopedRows.Count)"
-            Append-Log '========================================'
-            foreach ($row in $userScopedRows) {
-                $id = [string](Get-RowValue -Row $row -ColumnName 'Id')
-                $source = ([string](Get-RowValue -Row $row -ColumnName 'Source')).Trim()
-                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Aktualizacja (User)...'
-                [System.Windows.Forms.Application]::DoEvents()
+            $arguments = @(New-WingetPackageUpgradeArguments `
+                -Id $id `
+                -Source $source `
+                -Capabilities $Script:WingetInfo `
+                -SourceAgreementsAccepted $Script:SourceAgreementsAccepted `
+                -PackageAgreementsConfirmed $true `
+                -Interactive ($null -ne $Script:InteractiveCheck -and $Script:InteractiveCheck.Checked) `
+                -Silent ($null -ne $Script:SilentCheck -and $Script:SilentCheck.Checked) `
+                -IncludeUnknown ($null -ne $Script:IncludeUnknownCheck -and $Script:IncludeUnknownCheck.Checked))
+            $result = Invoke-Winget -Arguments $arguments -Package $package -LiveLog
 
-                $arguments = @(New-WingetPackageUpgradeArguments -Id $id -Source $source)
-                Append-Log "> winget $($arguments -join ' ')"
-                $result = Invoke-Winget -Arguments $arguments -LiveLog
-
-                if ($result.ExitCode -eq 0) {
-                    Set-RowValue -Row $row -ColumnName 'Status' -Value 'OK'
-                    $Script:AttemptedUpdates[$id] = [string](Get-RowValue -Row $row -ColumnName 'AvailableVersion')
-                } else {
-                    Set-RowValue -Row $row -ColumnName 'Status' -Value "Blad: $($result.ExitCode)"
-                }
+            if ($result.Cancelled) {
+                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Anulowano'
+                Append-Log "Anulowano [$id]"
+                break
             }
-        }
-
-        if ($machineScopedRows.Count -gt 0) {
-            Append-Log ''
-            Append-Log '========================================'
-            Append-Log "Aktualizacja administracyjna (Machine-Scoped): $($machineScopedRows.Count)"
-            Append-Log 'Wyswietlam powiadomienie UAC (Zaakceptuj)...'
-            Append-Log '========================================'
-
-            foreach ($row in $machineScopedRows) {
-                $id = [string](Get-RowValue -Row $row -ColumnName 'Id')
-                $source = ([string](Get-RowValue -Row $row -ColumnName 'Source')).Trim()
-                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Aktualizacja (UAC)...'
-                [System.Windows.Forms.Application]::DoEvents()
-
-                $arguments = @(New-WingetPackageUpgradeArguments -Id $id -Source $source)
-                Append-Log "> [ADMIN] winget $($arguments -join ' ')"
-
-                $exitCode = Invoke-WingetElevated -Arguments $arguments
-
-                if ($exitCode -eq 0) {
-                    Set-RowValue -Row $row -ColumnName 'Status' -Value 'Zakonczono'
-                    $Script:AttemptedUpdates[$id] = [string](Get-RowValue -Row $row -ColumnName 'AvailableVersion')
-                } else {
-                    Set-RowValue -Row $row -ColumnName 'Status' -Value 'Anulowano/Blad'
-                }
+            elseif (-not $result.Started) {
+                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad uruchomienia'
+                Append-Log "BLAD INFRASTRUKTURY [$id]: proces nie zostal uruchomiony. $($result.InfrastructureError)"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($result.InfrastructureError)) {
+                Set-RowValue -Row $row -ColumnName 'Status' -Value 'Blad infrastruktury'
+                Append-Log "BLAD INFRASTRUKTURY [$id]: $($result.InfrastructureError)"
+            }
+            elseif ($result.ExitCode -eq 0) {
+                Set-RowValue -Row $row -ColumnName 'Status' -Value 'OK'
+                $attemptKey = Get-PackageAttemptKey -Id $id -Source $source
+                $Script:AttemptedUpdates[$attemptKey] = [string](Get-RowValue -Row $row -ColumnName 'AvailableVersion')
+                $Script:SuccessfulAttemptResults[$attemptKey] = $result
+                Remove-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Id $id -Source $source
+            }
+            else {
+                Set-RowValue -Row $row -ColumnName 'Status' -Value "Blad: $($result.ExitCode)"
+                Add-WingetUpdaterSessionFailure -Registry $Script:UnresolvedFailures -Package $package -Result $result -FailureType 'PackageUpgradeFailure'
             }
         }
 
-        Set-Busy -Busy $false -Message 'Aktualizacja zakonczona. Odwiezenie listy...'
-        Refresh-Packages -PreserveLog
+        if (-not (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)) {
+            $Script:StatusLabel.Text = 'Aktualizacja zakonczona. Odwiezenie listy...'
+            Refresh-Packages -PreserveLog -ListOnly -KeepBusy
+        }
+        else {
+            $Script:StatusLabel.Text = 'Anulowano.'
+        }
     }
     catch {
         Append-Log $_.Exception.Message
@@ -1937,9 +1674,9 @@ function Update-SelectedPackages {
             [System.Windows.Forms.MessageBoxIcon]::Error
         ) | Out-Null
     }
-    finally {
-        Set-Busy -Busy $false -Message $Script:StatusLabel.Text
-    }
+      finally {
+        Complete-Operation -Message $Script:StatusLabel.Text
+      }
 }
 
 function Get-UnknownPackageRows {
@@ -2035,192 +1772,93 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
     return "'" + (([string]$Text) -replace "'", "''") + "'"
 }
 
-function New-RepairContextFile {
-    param(
-        [object[]]$Rows,
-        [string]$Agent,
-        [string]$Terminal
-    )
-
-    if (-not (Test-Path -LiteralPath $Script:RepairDir)) {
-        [void](New-Item -ItemType Directory -Force -Path $Script:RepairDir)
+function Get-SelectedFailedPackageRows {
+    if ($null -eq $Script:Grid) {
+        return @()
     }
-
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $path = Join-Path $Script:RepairDir "unknown-packages-$stamp.txt"
-    $lines = New-Object System.Collections.Generic.List[string]
-
-    [void]$lines.Add('ZADANIE DLA AGENTA CLI')
-    [void]$lines.Add('')
-    [void]$lines.Add('Masz pomoc naprawic pakiety winget, ktore maja obecna wersje Unknown albo pojawiaja sie po winget upgrade --include-unknown / -u.')
-    [void]$lines.Add('Najpierw zrob research: sprawdz dokumentacje winget, znane problemy pakietow, zrodla producenta oraz sensowna przyczyne rozjazdu wersji.')
-    [void]$lines.Add('')
-    [void]$lines.Add('Zasady bezpieczenstwa:')
-    [void]$lines.Add('1. Nie wykonuj zadnych zmian bez jasnego potwierdzenia uzytkownika.')
-    [void]$lines.Add('2. Przed kazda zmiana przedstaw diagnoze, plan i dokladne komendy, ktore chcesz uruchomic.')
-    [void]$lines.Add('3. Za zmiany uznaj zwlaszcza: upgrade, install, uninstall, repair, modyfikacje rejestru, kasowanie plikow/katalogow, zmiany PATH i zmiany konfiguracji aplikacji.')
-    [void]$lines.Add('4. Komendy tylko odczytowe i diagnostyczne mozesz proponowac najpierw, ale nadal pokaz uzytkownikowi co uruchamiasz i po co.')
-    [void]$lines.Add('5. Po diagnostyce podsumuj przyczyne oraz zaproponuj najbezpieczniejszy sposob naprawy dla kazdego pakietu osobno.')
-    [void]$lines.Add('')
-    [void]$lines.Add("Agent wybrany w programie: $Agent")
-    [void]$lines.Add("Terminal wybrany w programie: $Terminal")
-    [void]$lines.Add("Katalog roboczy terminala: $([Environment]::GetFolderPath('UserProfile'))")
-    [void]$lines.Add("Runtime programu: $(Get-PowerShellRuntimeText)")
-    if ($null -ne $Script:WingetInfo) {
-        [void]$lines.Add("winget path: $($Script:WingetInfo.Path)")
-        [void]$lines.Add("winget version: $($Script:WingetInfo.VersionText)")
-        [void]$lines.Add("winget supports --include-unknown: $($Script:WingetInfo.SupportsIncludeUnknown)")
+    $selectedRows = New-Object System.Collections.Generic.List[object]
+    foreach ($gridRow in $Script:Grid.SelectedRows) {
+        $status = [string](Get-RowValue -Row $gridRow -ColumnName 'Status')
+        $issue = [string](Get-RowValue -Row $gridRow -ColumnName 'IssueType')
+        if ($status -match '^Blad' -or $issue -eq 'Aplikacja samoaktualizujaca') {
+            $id = [string](Get-RowValue -Row $gridRow -ColumnName 'Id')
+            $source = [string](Get-RowValue -Row $gridRow -ColumnName 'Source')
+            $name = [string](Get-RowValue -Row $gridRow -ColumnName 'Name')
+            $currentVersion = [string](Get-RowValue -Row $gridRow -ColumnName 'CurrentVersion')
+            $availableVersion = [string](Get-RowValue -Row $gridRow -ColumnName 'AvailableVersion')
+            [void]$selectedRows.Add([pscustomobject]@{
+                Id = $id
+                Source = $source
+                Name = $name
+                CurrentVersion = $currentVersion
+                AvailableVersion = $availableVersion
+            })
+        }
     }
-    [void]$lines.Add('')
-    [void]$lines.Add('Pakiety do sprawdzenia:')
-    [void]$lines.Add('Name | Id | CurrentVersion | AvailableVersion | Source')
-    [void]$lines.Add('-----|----|----------------|------------------|-------')
-
-    foreach ($row in $Rows) {
-        $name = ConvertTo-CellText (Get-RowValue -Row $row -ColumnName 'Name')
-        $id = ConvertTo-CellText (Get-RowValue -Row $row -ColumnName 'Id')
-        $current = ConvertTo-CellText (Get-RowValue -Row $row -ColumnName 'CurrentVersion')
-        $available = ConvertTo-CellText (Get-RowValue -Row $row -ColumnName 'AvailableVersion')
-        $source = ConvertTo-CellText (Get-RowValue -Row $row -ColumnName 'Source')
-        [void]$lines.Add("$name | $id | $current | $available | $source")
-    }
-
-    [void]$lines.Add('')
-    [void]$lines.Add('Przydatne komendy diagnostyczne do rozwazenia dla kazdego ID:')
-    [void]$lines.Add('winget list --id <ID> --exact')
-    [void]$lines.Add('winget show --id <ID> --exact')
-    [void]$lines.Add('winget upgrade --id <ID> --exact --include-unknown')
-    [void]$lines.Add('winget pin list')
-    [void]$lines.Add('')
-    [void]$lines.Add('Wazne: uzytkownik chce konsultacji i potwierdzenia przed wszystkimi zmianami.')
-
-    $lines | Set-Content -LiteralPath $path -Encoding UTF8
-    return $path
+    return ,$selectedRows.ToArray()
 }
 
-function New-RepairPowerShellLauncher {
-    param(
-        [string]$PromptPath,
-        [string]$Agent
-    )
-
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $path = Join-Path $Script:RepairDir "launch-repair-$stamp.ps1"
-    $prompt = "Przeczytaj plik kontekstu: $PromptPath. To zadanie dotyczy naprawy pakietow winget z wersja Unknown / --include-unknown. Najpierw zrob research i diagnostyke. Nie wykonuj zmian bez jasnego potwierdzenia uzytkownika."
-    $promptLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Text $prompt
-    $promptPathLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Text $PromptPath
-
-    $cli = if ($Agent -match 'Gemini') { 'gemini' } else { 'codex' }
-    $content = New-Object System.Collections.Generic.List[string]
-    [void]$content.Add('$ErrorActionPreference = ''Stop''')
-    [void]$content.Add('Set-Location -LiteralPath ([Environment]::GetFolderPath(''UserProfile''))')
-    [void]$content.Add('$promptPath = ' + $promptPathLiteral)
-    [void]$content.Add('$agentPrompt = ' + $promptLiteral)
-    [void]$content.Add('Write-Host "Kontekst naprawy: $promptPath"')
-    [void]$content.Add("if (-not (Get-Command $cli -ErrorAction SilentlyContinue)) { Write-Host 'Nie znaleziono $cli w PATH.'; return }")
-    if ($cli -eq 'gemini') {
-        [void]$content.Add('& gemini --approval-mode default --prompt-interactive $agentPrompt')
-    }
-    else {
-        [void]$content.Add('& codex --cd ([Environment]::GetFolderPath(''UserProfile'')) --ask-for-approval on-request --search $agentPrompt')
-    }
-
-    $content | Set-Content -LiteralPath $path -Encoding UTF8
-    return $path
-}
-
-function New-RepairCmdLauncher {
-    param(
-        [string]$PromptPath,
-        [string]$Agent
-    )
-
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $path = Join-Path $Script:RepairDir "launch-repair-$stamp.cmd"
-    $prompt = "Przeczytaj plik kontekstu: $PromptPath. To zadanie dotyczy naprawy pakietow winget z wersja Unknown / --include-unknown. Najpierw zrob research i diagnostyke. Nie wykonuj zmian bez jasnego potwierdzenia uzytkownika."
-    $cli = if ($Agent -match 'Gemini') { 'gemini' } else { 'codex' }
-    $content = New-Object System.Collections.Generic.List[string]
-    [void]$content.Add('@echo off')
-    [void]$content.Add('cd /d "%USERPROFILE%"')
-    [void]$content.Add("set ""AGENT_PROMPT=$prompt""")
-    [void]$content.Add("echo Kontekst naprawy: $PromptPath")
-    [void]$content.Add("where $cli >nul 2>nul")
-    [void]$content.Add('if errorlevel 1 (')
-    [void]$content.Add("  echo Nie znaleziono $cli w PATH.")
-    [void]$content.Add('  goto :eof')
-    [void]$content.Add(')')
-    if ($cli -eq 'gemini') {
-        [void]$content.Add('gemini --approval-mode default --prompt-interactive "%AGENT_PROMPT%"')
-    }
-    else {
-        [void]$content.Add('codex --cd "%USERPROFILE%" --ask-for-approval on-request --search "%AGENT_PROMPT%"')
-    }
-
-    $content | Set-Content -LiteralPath $path -Encoding ASCII
-    return $path
-}
-
-function Start-UnknownRepairSession {
-    Commit-GridEdits
-
-    $rows = Get-UnknownPackageRows
-    if ($rows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show(
-            'Nie ma teraz pakietow z wersja Unknown. Najpierw kliknij Odswiez z wlaczona opcja --include-unknown.',
-            'Winget Updater',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
+function Copy-AIFailureContext {
+    if (-not (Test-OperationEntryAllowed)) {
         return
     }
-
-    [void](Assert-PackageRows -Rows $rows -Operation 'Naprawa Unknown')
-
-    $agent = [string]$Script:AgentCombo.SelectedItem
-    if ([string]::IsNullOrWhiteSpace($agent)) {
-        $agent = 'Codex CLI'
-    }
-
-    $terminal = [string]$Script:TerminalCombo.SelectedItem
-    if ([string]::IsNullOrWhiteSpace($terminal)) {
-        $terminal = 'PowerShell 7 admin'
-    }
-
-    $cli = if ($agent -match 'Gemini') { 'gemini' } else { 'codex' }
-    if ($null -eq (Get-Command $cli -ErrorAction SilentlyContinue)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Nie znaleziono $cli w PATH.",
-            'Winget Updater',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-        return
-    }
+    Set-Busy -Busy $true -Message 'Przygotowywanie informacji dla AI...'
 
     try {
-        Initialize-WingetInfo
-        Sync-WingetUiCapabilities
-    }
-    catch {
-        Append-Log "UWAGA: nie udalo sie odswiezyc informacji winget przed naprawa: $($_.Exception.Message)"
-    }
+        Commit-GridEdits
 
-    $promptPath = New-RepairContextFile -Rows $rows -Agent $agent -Terminal $terminal
-    $userProfile = [Environment]::GetFolderPath('UserProfile')
+        $selectedPackages = Get-SelectedFailedPackageRows
+        $failures = @(Get-WingetUpdaterSessionFailures -Registry $Script:UnresolvedFailures -SelectedPackages $selectedPackages)
 
-    if ($terminal -match '^CMD') {
-        $launcher = New-RepairCmdLauncher -PromptPath $promptPath -Agent $agent
-        Start-Process -FilePath 'cmd.exe' -ArgumentList "/k ""$launcher""" -WorkingDirectory $userProfile -Verb RunAs
-    }
-    elseif ($terminal -match 'PowerShell 5') {
-        $launcher = New-RepairPowerShellLauncher -PromptPath $promptPath -Agent $agent
-        Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoExit -ExecutionPolicy Bypass -File ""$launcher""" -WorkingDirectory $userProfile -Verb RunAs
-    }
-    else {
-        $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
-        if ($null -eq $pwsh) {
+        if ($failures.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show(
-                'Nie znaleziono PowerShell 7 (pwsh). Wybierz PowerShell 5 albo CMD.',
+                'Brak zarejestrowanych błędów aktualizacji w tej sesji.',
+                'Winget Updater',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+            return
+        }
+
+        $warningMsg = "Ostrzezenie o prywatnosci: Plik kontekstu diagnostycznego oraz logi wyjsciowe moga zawierac lokalne sciezki lub dane systemowe.`r`n`r`nCzy chcesz utworzyc plik kontekstu i skopiowac tresc promptu do schowka?"
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            $warningMsg,
+            'Ostrzezenie o prywatnosci - Winget Updater',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+            return
+        }
+
+        $contextPath = New-WingetUpdaterRepairContextFile -Directory $Script:Paths.RepairContextsDirectory -Failures $failures
+        $promptText = Get-WingetUpdaterAIPrompt -ContextFilePath $contextPath
+
+        [System.Windows.Forms.Clipboard]::SetText($promptText)
+
+        Append-Log "Utworzono plik kontekstu diagnostycznego: $contextPath"
+        Append-Log "Skopiowano tresc promptu AI do schowka."
+        $Script:StatusLabel.Text = "Skopiowano tresc promptu AI do schowka."
+    }
+    finally {
+        Complete-Operation -Message $Script:StatusLabel.Text
+    }
+}
+
+function Open-SelectedAICli {
+    if (-not (Test-OperationEntryAllowed)) {
+        return
+    }
+    Set-Busy -Busy $true -Message 'Uruchamianie CLI AI...'
+
+    try {
+        $selectedItem = [string]$Script:AgentCombo.SelectedItem
+        $cliName = if ($selectedItem -match 'agy') { 'agy' } else { 'codex' }
+
+        $resolvedPath = Resolve-WingetUpdaterAICliPath -CliName $cliName
+        if ([string]::IsNullOrWhiteSpace($resolvedPath)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Nie znaleziono $cliName w PATH.",
                 'Winget Updater',
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Error
@@ -2228,11 +1866,12 @@ function Start-UnknownRepairSession {
             return
         }
 
-        $launcher = New-RepairPowerShellLauncher -PromptPath $promptPath -Agent $agent
-        Start-Process -FilePath $pwsh.Source -ArgumentList "-NoExit -ExecutionPolicy Bypass -File ""$launcher""" -WorkingDirectory $userProfile -Verb RunAs
+        Start-WingetUpdaterAICliProcess -CliPath $resolvedPath
+        Append-Log "Uruchomiono interaktywny CLI: $cliName ($resolvedPath)"
     }
-
-    Append-Log "Utworzono kontekst naprawy: $promptPath"
+    finally {
+        Complete-Operation -Message $Script:StatusLabel.Text
+    }
 }
 
 function Add-TextColumn {
@@ -2263,7 +1902,6 @@ function Set-ControlToolTip {
     }
 }
 
-# Usunięto wywołanie Ensure-RunningAsAdministrator - program używa Smart Batching i samodzielnie prosi o UAC podczas instalacji.
 Load-SkipList
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -2318,14 +1956,7 @@ $Script:RefreshButton.Text = 'Odswiez'
 $Script:RefreshButton.Width = 90
 $Script:RefreshButton.Height = 28
 $Script:RefreshButton.Add_Click({ try { Refresh-Packages } catch { Show-AppError -ErrorRecord $_ -Title 'Blad podczas odswiezania' } })
-Set-ControlToolTip -Control $Script:RefreshButton -Text 'Sprawdza dostepne aktualizacje przez winget upgrade i odswieza tabele. Gdy zaznaczono Baza przed sprawdz., najpierw uruchamia winget source update.'
-
-$Script:SourceUpdateButton = New-Object System.Windows.Forms.Button
-$Script:SourceUpdateButton.Text = 'Aktualizuj baze'
-$Script:SourceUpdateButton.Width = 120
-$Script:SourceUpdateButton.Height = 28
-$Script:SourceUpdateButton.Add_Click({ try { Update-WingetSources } catch { Show-AppError -ErrorRecord $_ -Title 'Blad podczas odswiezania bazy winget' } })
-Set-ControlToolTip -Control $Script:SourceUpdateButton -Text 'Uruchamia recznie winget source update, czyli odswieza baze/listy pakietow winget bez aktualizacji programow.'
+Set-ControlToolTip -Control $Script:RefreshButton -Text 'Najpierw odswieza zrodla przez winget source update, a potem sprawdza aktualizacje i bezpiecznie zastepuje tabele.'
 
 $Script:UpdateButton = New-Object System.Windows.Forms.Button
 $Script:UpdateButton.Text = 'Aktualizuj zaznaczone'
@@ -2397,49 +2028,49 @@ $Script:IncludeUnknownCheck.Height = 28
 $Script:IncludeUnknownCheck.Checked = $true
 Set-ControlToolTip -Control $Script:IncludeUnknownCheck -Text 'Dodaje --include-unknown. Pokazuje i pozwala aktualizowac pakiety, dla ktorych winget nie zna obecnej wersji.'
 
-$Script:SourceUpdateCheck = New-Object System.Windows.Forms.CheckBox
-$Script:SourceUpdateCheck.Text = 'Baza przed sprawdz.'
-$Script:SourceUpdateCheck.Width = 145
-$Script:SourceUpdateCheck.Height = 28
-$Script:SourceUpdateCheck.Checked = $true
-Set-ControlToolTip -Control $Script:SourceUpdateCheck -Text 'Domyslnie przed kazdym odswiezeniem listy uruchamia winget source update, zeby odswiezyc baze/listy pakietow.'
 
-$Script:TerminalCombo = New-Object System.Windows.Forms.ComboBox
-$Script:TerminalCombo.DropDownStyle = 'DropDownList'
-$Script:TerminalCombo.Width = 145
-$Script:TerminalCombo.Height = 28
-[void]$Script:TerminalCombo.Items.AddRange([object[]]@('PowerShell 7 admin', 'PowerShell 5 admin', 'CMD admin'))
-if ($null -ne (Get-Command pwsh -ErrorAction SilentlyContinue)) {
-    $Script:TerminalCombo.SelectedItem = 'PowerShell 7 admin'
-}
-else {
-    $Script:TerminalCombo.SelectedItem = 'PowerShell 5 admin'
-}
-Set-ControlToolTip -Control $Script:TerminalCombo -Text 'Wybiera terminal administratora uzywany przez Napraw Unknown.'
+$Script:CopyMessageButton = New-Object System.Windows.Forms.Button
+$Script:CopyMessageButton.Text = 'Kopiuj wiadomość AI'
+$Script:CopyMessageButton.Width = 140
+$Script:CopyMessageButton.Height = 28
+$Script:CopyMessageButton.Add_Click({ try { Copy-AIFailureContext } catch { Show-AppError -ErrorRecord $_ -Title 'Błąd kopiowania wiadomości AI' } })
+Set-ControlToolTip -Control $Script:CopyMessageButton -Text 'Tworzy plik kontekstu z zarejestrowanymi błędami i kopiuje tresc promptu dla AI do schowka.'
 
 $Script:AgentCombo = New-Object System.Windows.Forms.ComboBox
 $Script:AgentCombo.DropDownStyle = 'DropDownList'
 $Script:AgentCombo.Width = 95
 $Script:AgentCombo.Height = 28
-[void]$Script:AgentCombo.Items.AddRange([object[]]@('Codex CLI', 'Gemini CLI'))
+[void]$Script:AgentCombo.Items.AddRange([object[]]@('Codex CLI', 'agy CLI'))
 if ($null -ne (Get-Command codex -ErrorAction SilentlyContinue)) {
     $Script:AgentCombo.SelectedItem = 'Codex CLI'
 }
 else {
-    $Script:AgentCombo.SelectedItem = 'Gemini CLI'
+    $Script:AgentCombo.SelectedItem = 'agy CLI'
 }
-Set-ControlToolTip -Control $Script:AgentCombo -Text 'Wybiera CLI, ktore dostanie kontekst diagnostyczny dla pakietow Unknown.'
+Set-ControlToolTip -Control $Script:AgentCombo -Text 'Wybiera CLI AI do uruchomienia w osobnym konsolowym oknie.'
 
-$Script:RepairButton = New-Object System.Windows.Forms.Button
-$Script:RepairButton.Text = 'Napraw Unknown'
-$Script:RepairButton.Width = 125
-$Script:RepairButton.Height = 28
-$Script:RepairButton.Add_Click({ try { Start-UnknownRepairSession } catch { Show-AppError -ErrorRecord $_ -Title 'Blad podczas naprawy Unknown' } })
-Set-ControlToolTip -Control $Script:RepairButton -Text 'Tworzy kontekst diagnostyczny dla pakietow Unknown i uruchamia wybrany CLI jako administrator.'
+$Script:OpenAiCliButton = New-Object System.Windows.Forms.Button
+$Script:OpenAiCliButton.Text = 'Otwórz CLI AI'
+$Script:OpenAiCliButton.Width = 105
+$Script:OpenAiCliButton.Height = 28
+$Script:OpenAiCliButton.Add_Click({ try { Open-SelectedAICli } catch { Show-AppError -ErrorRecord $_ -Title 'Błąd uruchamiania CLI AI' } })
+Set-ControlToolTip -Control $Script:OpenAiCliButton -Text 'Otwiera wybrany interaktywny CLI (Codex lub agy) w nowym oknie konsoli bez podnoszenia uprawnien.'
 
-$adminText = if (Test-IsAdministrator) { 'Administrator: tak' } else { 'Administrator: nie' }
+$Script:CancelButton = New-Object System.Windows.Forms.Button
+$Script:CancelButton.Text = 'Anuluj'
+$Script:CancelButton.Width = 90
+$Script:CancelButton.Height = 28
+$Script:CancelButton.Enabled = $false
+$Script:CancelButton.Visible = $false
+$Script:CancelButton.Add_Click({
+    if ($Script:IsBusy) {
+        [void](Confirm-OperationCancellation)
+    }
+})
+Set-ControlToolTip -Control $Script:CancelButton -Text 'Zatrzymuje biezacy proces winget i pomija pozostale pakiety.'
+
 $Script:StatusLabel = New-Object System.Windows.Forms.Label
-$Script:StatusLabel.Text = "$adminText. $(Get-PowerShellRuntimeText). Gotowe."
+$Script:StatusLabel.Text = "$(Get-PowerShellRuntimeText). Gotowe."
 $Script:StatusLabel.AutoSize = $true
 $Script:StatusLabel.Margin = New-Object System.Windows.Forms.Padding(12, 7, 3, 3)
 Set-ControlToolTip -Control $Script:StatusLabel -Text 'Biezacy stan programu.'
@@ -2454,7 +2085,6 @@ $Script:SpinnerLabel.Margin = New-Object System.Windows.Forms.Padding(8, 2, 0, 0
 Set-ControlToolTip -Control $Script:SpinnerLabel -Text 'Spinner pracy winget. Obraca sie w czasie sprawdzania lub aktualizacji.'
 
 [void]$topPanel.Controls.Add($Script:RefreshButton)
-[void]$topPanel.Controls.Add($Script:SourceUpdateButton)
 [void]$topPanel.Controls.Add($Script:UpdateButton)
 [void]$topPanel.Controls.Add($Script:SaveButton)
 [void]$topPanel.Controls.Add($Script:LoadSkippedButton)
@@ -2465,7 +2095,6 @@ Set-ControlToolTip -Control $Script:SpinnerLabel -Text 'Spinner pracy winget. Ob
 [void]$topPanel.Controls.Add($Script:SilentCheck)
 [void]$topPanel.Controls.Add($Script:InteractiveCheck)
 [void]$topPanel.Controls.Add($Script:IncludeUnknownCheck)
-[void]$topPanel.Controls.Add($Script:SourceUpdateCheck)
 
 # --- POCZĄTEK: UI TRYBU TESTOWEGO ---
 $Script:TestModeCheck = New-Object System.Windows.Forms.CheckBox
@@ -2478,9 +2107,10 @@ Set-ControlToolTip -Control $Script:TestModeCheck -Text 'Symuluje dzialanie wing
 [void]$topPanel.Controls.Add($Script:TestModeCheck)
 # --- KONIEC: UI TRYBU TESTOWEGO ---
 
-[void]$topPanel.Controls.Add($Script:TerminalCombo)
+[void]$topPanel.Controls.Add($Script:CopyMessageButton)
 [void]$topPanel.Controls.Add($Script:AgentCombo)
-[void]$topPanel.Controls.Add($Script:RepairButton)
+[void]$topPanel.Controls.Add($Script:OpenAiCliButton)
+[void]$topPanel.Controls.Add($Script:CancelButton)
 [void]$topPanel.Controls.Add($Script:SpinnerLabel)
 [void]$topPanel.Controls.Add($Script:StatusLabel)
 
@@ -2599,6 +2229,40 @@ $Script:CopyrightLabel.Padding = New-Object System.Windows.Forms.Padding(0, 0, 8
 [void]$Script:Form.Controls.Add($layout)
 
 $Script:Form.Add_FormClosing({
+    param($formClosingSender, $formClosingEventArgs)
+    $null = $formClosingSender
+
+    $shouldCancelClose = Test-ShouldCancelFormClose
+    if ($shouldCancelClose) {
+        $formClosingEventArgs.Cancel = $true
+    }
+    $decision = Resolve-WingetUpdaterCloseRequest `
+        -IsBusy $Script:IsBusy `
+        -CancellationConfirmed $false `
+        -CancellationAlreadyRequested (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)
+    if ($Script:IsBusy) {
+        if (-not $decision.DeferClose) {
+            $choice = [System.Windows.Forms.MessageBox]::Show(
+                'Operacja jest w toku. Czy anulowac ja i zamknac program po zakonczeniu sprzatania?',
+                'Zamknij Winget Updater',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            $decision = Resolve-WingetUpdaterCloseRequest `
+                -IsBusy $Script:IsBusy `
+                -CancellationConfirmed ($choice -eq [System.Windows.Forms.DialogResult]::Yes) `
+                -CancellationAlreadyRequested (Test-WingetUpdaterCancellationRequested -State $Script:CancellationState)
+        }
+        $formClosingEventArgs.Cancel = $decision.CancelClose
+        if ($decision.DeferClose) {
+            $Script:ClosePending = $true
+        }
+        if ($decision.RequestCancellation) {
+            Request-WingetUpdaterCancellation -State $Script:CancellationState
+        }
+        return
+    }
+
     try {
         Save-SkipList -Silent
     }
@@ -2607,6 +2271,24 @@ $Script:Form.Add_FormClosing({
     }
 })
 
-$Script:Form.Add_Shown({ Refresh-Packages })
+$Script:Form.Add_Shown({
+    $preserveStartupWarnings = $false
+    foreach ($warning in $Script:StartupWarnings) {
+        Append-Log "UWAGA: $warning"
+        $preserveStartupWarnings = $true
+    }
+    Refresh-Packages -PreserveLog:$preserveStartupWarnings
+})
 
 [void][System.Windows.Forms.Application]::Run($Script:Form)
+}
+finally {
+    Dispose-WingetUpdaterResource -Resource $Script:Form -ResourceName 'Form'
+    $Script:Form = $null
+    Dispose-WingetUpdaterResource -Resource $Script:ToolTip -ResourceName 'ToolTip'
+    $Script:ToolTip = $null
+    if ($null -ne $Script:MutexLease) {
+        Exit-WingetUpdaterSingleInstance -Lease $Script:MutexLease
+        $Script:MutexLease = $null
+    }
+}

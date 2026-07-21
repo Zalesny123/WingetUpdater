@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Pester & PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.22.0 -Scope CurrentUser -Force
+          Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          $config = [PesterConfiguration]::Default
+          $config.Run.Path = './tests'
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          Invoke-Pester -Configuration $config
+
+      - name: Package Release ZIP & SHA256SUMS
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zipName = "WingetUpdater-$tag.zip"
+          $stagingDir = Join-Path $env:RUNNER_TEMP "release-staging"
+          [void](New-Item -ItemType Directory -Path $stagingDir -Force)
+
+          $files = @(
+              'Start.bat',
+              'WingetUpdater.ps1',
+              'WingetUpdater.Core.psm1',
+              'README.md',
+              'CHANGELOG.md',
+              'LICENSE'
+          )
+
+          foreach ($file in $files) {
+              if (-not (Test-Path -LiteralPath $file)) {
+                  throw "Missing required release file: $file"
+              }
+              Copy-Item -LiteralPath $file -Destination $stagingDir
+          }
+
+          Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipName -Force
+
+          $hash = (Get-FileHash -Path $zipName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zipName" | Out-File -FilePath SHA256SUMS -Encoding utf8
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+
+          files: |
+            WingetUpdater-*.zip
+            SHA256SUMS
+          draft: false
+          prerelease: false
+          generate_release_notes: true
