@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@6929c1d6d936f5b0830614442ec800944938f757 # v4.1.7
+        uses: actions/checkout@v4
 
       - name: Install Pester & PSScriptAnalyzer
         shell: pwsh
@@ -63,8 +63,9 @@ jobs:
           "$hash  $zipName" | Out-File -FilePath SHA256SUMS -Encoding utf8
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.0.8
+        uses: softprops/action-gh-release@v2
         with:
+
           files: |
             WingetUpdater-*.zip
             SHA256SUMS

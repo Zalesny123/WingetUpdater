@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@6929c1d6d936f5b0830614442ec800944938f757 # v4.1.7
+        uses: actions/checkout@v4
 
       - name: Install Pester & PSScriptAnalyzer
         run: |
