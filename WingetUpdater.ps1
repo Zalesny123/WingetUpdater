@@ -1132,8 +1132,9 @@ function Confirm-SourceAgreements {
         )
         return ($choice -eq [System.Windows.Forms.DialogResult]::Yes)
     }.GetNewClosure()
+    $settingsFile = $Script:Paths.SettingsFile
     $persistAction = {
-        Grant-WingetUpdaterSourceAgreements -Path $Script:Paths.SettingsFile | Out-Null
+        Grant-WingetUpdaterSourceAgreements -Path $settingsFile | Out-Null
         $Script:SourceAgreementsAccepted = $true
     }.GetNewClosure()
     $decision = Resolve-WingetUpdaterSourceAgreementConsent `
