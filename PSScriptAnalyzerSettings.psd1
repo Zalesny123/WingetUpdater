@@ -1,0 +1,6 @@
+@{
+    ExcludeRules = @(
+        'PSUseApprovedVerbs'
+        'PSUseSingularNouns'
+    )
+}

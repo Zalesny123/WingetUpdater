@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.1] - 2026-07-21
+
+### Security & Minimal Publication Gate Fixes
+- **Argument Safety**: Removed custom RunAs elevated script generation and code interpolation. Package updates run as non-elevated user; machine-scope package installers trigger native Windows UAC prompts.
+- **Quoting Engine**: Implemented `Join-CommandLineArguments` in `WingetUpdater.Core.psm1` adhering to Windows command line escaping rules (handling `'`, `"`, `;`, spaces, trailing backslashes).
+- **AI CLI Safety & Privacy**: Launched AI CLI (`codex`, `agy`) non-elevated at `%USERPROFILE%`. Added explicit Privacy Warning dialog before writing diagnostic context files and copying prompts.
+- **Launcher Security**: Updated `Start.bat` to pass direct `-File` arguments instead of interpolated `-Command` string execution.
+- **Automated Testing & Static Analysis**: Added Pester test suite (118 tests) and `PSScriptAnalyzerSettings.psd1` for code quality and security verification.
+- **CI & Release Packaging**: Added GitHub Actions CI (`ci.yml`) and tag-triggered release packaging workflow (`release.yml`) generating `SHA256SUMS`.
+
 ## [1.0.0] - 2026-05-30
 
 ### Added
@@ -19,15 +29,3 @@
 - Support for repairing packages with an unknown version through the **Repair Unknown** feature.
 - Generation of diagnostic context for an AI agent when repairing Unknown packages.
 - MIT license support.
-
-### Requirements
-
-- Windows.
-- Windows Package Manager (`winget`).
-- Windows PowerShell 5.1 or PowerShell 7+.
-
-### Safety notes
-
-- The program should be started through `Start.bat`.
-- The launcher displays the license text before the first run and saves a local acceptance marker.
-- The diagnostic context for the AI agent is designed for safe research and does not assume changes without explicit user confirmation.

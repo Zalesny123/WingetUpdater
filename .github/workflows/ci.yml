@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@6929c1d6d936f5b0830614442ec800944938f757 # v4.1.7
+
+      - name: Install Pester & PSScriptAnalyzer
+        run: |
+          Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.22.0 -Scope CurrentUser -Force
+          Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force
+
+      - name: Run PSScriptAnalyzer
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($results) {
+              $results | Format-Table -AutoSize
+              throw "PSScriptAnalyzer found issues."
+          }
+
+      - name: Run Pester tests
+        run: |
+          $config = [PesterConfiguration]::Default
+          $config.Run.Path = './tests'
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Exit = $true
+          Invoke-Pester -Configuration $config
