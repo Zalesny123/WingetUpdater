@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', '', Justification = 'Pester setup variables are consumed by It blocks.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Fixture helpers only modify the Pester TestDrive.')]
@@ -939,6 +939,104 @@ $state = Read-WingetUpdaterJson -Path '__MOCK__'
         $record.SpinnerStopCount | Should -Be 1
     }
 
+    It 'runs a deterministic repeated-failure then success Mock scenario through AI context cleanup' {
+        $functionDefinitions = @(
+            (Get-ScriptFunctionText -Name 'New-MockWingetResult')
+            (Get-ScriptFunctionText -Name 'Invoke-MockWingetDelay')
+            (Get-ScriptFunctionText -Name 'Assert-WingetCleanupGuaranteed')
+            (Get-ScriptFunctionText -Name 'Invoke-Winget')
+        ) -join "`r`n"
+        $moduleLiteral = (Join-Path (Split-Path -Parent $PSScriptRoot) 'WingetUpdater.Core.psm1').Replace("'", "''")
+        $harnessPath = Join-Path $TestDrive 'mock-retry-success-harness.ps1'
+        $harness = @'
+Import-Module -Name '__MODULE__' -Force -DisableNameChecking -ErrorAction Stop
+Set-StrictMode -Version 2.0
+$Script:Paths = [pscustomobject]@{ LogsDirectory = '__LOGS__'; RepairContextsDirectory = '__CONTEXTS__' }
+$Script:MockFile = '__MOCK__'
+$Script:TestModeCheck = [pscustomobject]@{ Checked = $true }
+$Script:CancellationState = New-WingetUpdaterCancellationState
+$Script:LogBox = $null
+function Reset-MockState { throw 'The fixture must already exist.' }
+function Update-LogLiveLine { param([string]$Spinner, [string]$Progress) }
+__FUNCTIONS__
+[void](New-Item -ItemType Directory -Path '__LOGS__' -Force)
+Write-WingetUpdaterJson -Path '__MOCK__' -Data ([ordered]@{
+    'Test.Success' = [ordered]@{ Name = 'Success App'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $false }
+    'Test.Failure' = [ordered]@{ Name = 'Failure App'; Current = '1.0'; Available = '2.0'; ExitCode = 17; Ghost = $false }
+    'Test.Ghost' = [ordered]@{ Name = 'Ghost App'; Current = '1.0'; Available = '2.0'; ExitCode = 0; Ghost = $true }
+    'Test.RetrySuccess' = [ordered]@{
+        Name = 'Retry Success App'
+        Current = '1.0'
+        Available = '2.0'
+        ExitCodes = @(71, 72, 0)
+        Attempt = 0
+        Ghost = $false
+    }
+})
+$successResult = Invoke-Winget -Arguments @('upgrade', '--id', 'Test.Success') -Package ([pscustomobject]@{ Id = 'Test.Success'; Name = 'Success App'; CurrentVersion = '1.0'; AvailableVersion = '2.0'; Source = 'winget' })
+$failureResult = Invoke-Winget -Arguments @('upgrade', '--id', 'Test.Failure') -Package ([pscustomobject]@{ Id = 'Test.Failure'; Name = 'Failure App'; CurrentVersion = '1.0'; AvailableVersion = '2.0'; Source = 'winget' })
+$ghostResult = Invoke-Winget -Arguments @('upgrade', '--id', 'Test.Ghost') -Package ([pscustomobject]@{ Id = 'Test.Ghost'; Name = 'Ghost App'; CurrentVersion = '1.0'; AvailableVersion = '2.0'; Source = 'winget' })
+$package = [pscustomobject]@{ Id = 'Test.RetrySuccess'; Name = 'Retry Success App'; CurrentVersion = '1.0'; AvailableVersion = '2.0'; Source = 'winget' }
+$registry = New-WingetUpdaterSessionFailureRegistry
+$exitCodes = @()
+foreach ($attempt in 1..3) {
+    $result = Invoke-Winget -Arguments @('upgrade', '--id', 'Test.RetrySuccess') -Package $package
+    $exitCodes += $result.ExitCode
+    if ($result.ExitCode -eq 0) {
+        Remove-WingetUpdaterSessionFailure -Registry $registry -Id $package.Id -Source $package.Source
+    }
+    else {
+        Add-WingetUpdaterSessionFailure -Registry $registry -Package $package -Result $result
+    }
+    if ($attempt -eq 2) {
+        $failures = @(Get-WingetUpdaterSessionFailures -Registry $registry)
+        $contextPath = New-WingetUpdaterRepairContextFile -Directory '__CONTEXTS__' -Failures $failures
+        $contextText = [System.IO.File]::ReadAllText($contextPath)
+        $attemptCountBeforeSuccess = $failures[0].AttemptCount
+    }
+}
+$state = Read-WingetUpdaterJson -Path '__MOCK__'
+[pscustomobject]@{
+    ExitCodes = $exitCodes
+    SuccessExitCode = $successResult.ExitCode
+    FailureExitCode = $failureResult.ExitCode
+    GhostExitCode = $ghostResult.ExitCode
+    SuccessCurrent = [string]$state.'Test.Success'.Current
+    FailureCurrent = [string]$state.'Test.Failure'.Current
+    GhostCurrent = [string]$state.'Test.Ghost'.Current
+    MockAttempt = [int]$state.'Test.RetrySuccess'.Attempt
+    Current = [string]$state.'Test.RetrySuccess'.Current
+    FailureAttemptCount = [int]$attemptCountBeforeSuccess
+    RemainingFailures = @(Get-WingetUpdaterSessionFailures -Registry $registry).Count
+    Context = $contextText
+} | ConvertTo-Json -Compress
+'@
+        $harness = $harness.Replace('__MODULE__', $moduleLiteral)
+        $harness = $harness.Replace('__LOGS__', (Join-Path $TestDrive 'mock-retry-logs').Replace("'", "''"))
+        $harness = $harness.Replace('__CONTEXTS__', (Join-Path $TestDrive 'mock-retry-contexts').Replace("'", "''"))
+        $harness = $harness.Replace('__MOCK__', (Join-Path $TestDrive 'MockRetryState.json').Replace("'", "''"))
+        $harness = $harness.Replace('__FUNCTIONS__', $functionDefinitions)
+        [System.IO.File]::WriteAllText($harnessPath, $harness, (New-Object System.Text.UTF8Encoding($false)))
+
+        $output = & pwsh -NoLogo -NoProfile -File $harnessPath 2>&1
+        $LASTEXITCODE | Should -Be 0
+        $record = (($output | ForEach-Object { [string]$_ }) -join "`n") | ConvertFrom-Json
+        @($record.ExitCodes) | Should -Be @(71, 72, 0)
+        $record.SuccessExitCode | Should -Be 0
+        $record.FailureExitCode | Should -Be 17
+        $record.GhostExitCode | Should -Be 0
+        $record.SuccessCurrent | Should -BeExactly '2.0'
+        $record.FailureCurrent | Should -BeExactly '1.0'
+        $record.GhostCurrent | Should -BeExactly '1.0'
+        $record.MockAttempt | Should -Be 3
+        $record.Current | Should -BeExactly '2.0'
+        $record.FailureAttemptCount | Should -Be 2
+        $record.RemainingFailures | Should -Be 0
+        $record.Context | Should -Match 'Attempt Count: 2'
+        $record.Context | Should -Match 'STDERR:'
+        $record.Context | Should -Match 'Error'
+    }
+
     It 'guards direct busy list and selection calls while allowing explicit internal bypass' {
         $targetDefinitions = @(
             (Get-ScriptFunctionText -Name 'Test-OperationEntryAllowed')
@@ -1045,11 +1143,52 @@ $internalApply = Apply-SkipListToVisiblePackages -Silent -BypassBusyGuard
 
         $consentText | Should -Match 'Resolve-WingetUpdaterSourceAgreementConsent'
         $consentText | Should -Match '\$Script:TestModeCheck\.Checked'
+        $consentText | Should -Match '\$settingsFile\s*=\s*\$Script:Paths\.SettingsFile'
         $consentText | Should -Match 'Grant-WingetUpdaterSourceAgreements\s+-Path\s+\$settingsFile'
         $consentText | Should -Match 'pelny dostep.*Odswiez.*Mock'
         $refreshText | Should -Match '(?s)if\s*\(-not\s+\(Confirm-SourceAgreements\)\).*?return'
         $refreshText.IndexOf('Confirm-SourceAgreements') | Should -BeLessThan $refreshText.IndexOf('Initialize-WingetInfo')
         $refreshText.IndexOf('Confirm-SourceAgreements') | Should -BeLessThan $refreshText.IndexOf('Invoke-WingetSourceUpdate')
+    }
+
+    It 'updates the real script-scope consent flag immediately after first acceptance' {
+        $consentFunction = Get-ScriptFunctionText -Name 'Confirm-SourceAgreements'
+        $moduleLiteral = (Join-Path (Split-Path -Parent $PSScriptRoot) 'WingetUpdater.Core.psm1').Replace("'", "''")
+        $harnessPath = Join-Path $TestDrive 'source-consent-scope-harness.ps1'
+        $harness = @'
+Import-Module -Name '__MODULE__' -Force -DisableNameChecking -ErrorAction Stop
+Set-StrictMode -Version 2.0
+$Script:TestModeCheck = [pscustomobject]@{ Checked = $false }
+$Script:SourceAgreementsAccepted = $false
+$Script:Paths = [pscustomobject]@{ SettingsFile = '__SETTINGS__' }
+$Script:StatusLabel = [pscustomobject]@{ Text = '' }
+$promptState = [pscustomobject]@{ Count = 0 }
+Write-WingetUpdaterJson -Path '__SETTINGS__' -Data ([pscustomobject]@{ schemaVersion = 1; migrationVersion = 1; sourceAgreementsAccepted = $false })
+__FUNCTION__
+$first = Confirm-SourceAgreements -PromptAction { $promptState.Count++; return $true }
+$second = Confirm-SourceAgreements -PromptAction { $promptState.Count++; return $false }
+$settings = Read-WingetUpdaterJson -Path '__SETTINGS__'
+[pscustomobject]@{
+    First = [bool]$first
+    Second = [bool]$second
+    PromptCount = $promptState.Count
+    OuterFlag = [bool]$Script:SourceAgreementsAccepted
+    Persisted = [bool]$settings.sourceAgreementsAccepted
+} | ConvertTo-Json -Compress
+'@
+        $harness = $harness.Replace('__MODULE__', $moduleLiteral)
+        $harness = $harness.Replace('__SETTINGS__', (Join-Path $TestDrive 'settings.json').Replace("'", "''"))
+        $harness = $harness.Replace('__FUNCTION__', $consentFunction)
+        [System.IO.File]::WriteAllText($harnessPath, $harness, (New-Object System.Text.UTF8Encoding($false)))
+
+        $output = & pwsh -NoLogo -NoProfile -File $harnessPath 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because (($output | ForEach-Object { [string]$_ }) -join "`n")
+        $record = (($output | ForEach-Object { [string]$_ }) -join "`n") | ConvertFrom-Json
+        $record.First | Should -BeTrue
+        $record.Second | Should -BeTrue
+        $record.PromptCount | Should -Be 1
+        $record.OuterFlag | Should -BeTrue
+        $record.Persisted | Should -BeTrue
     }
 
     It 'loads consent only from settings and never treats the legacy notice marker as acceptance' {
@@ -1063,7 +1202,8 @@ $internalApply = Apply-SkipListToVisiblePackages -Silent -BypassBusyGuard
         $listText = Get-ScriptFunctionText -Name 'New-WingetUpgradeListArguments'
         $updateText = Get-ScriptFunctionText -Name 'Update-SelectedPackages'
 
-        $sourceText | Should -Match 'New-WingetSourceUpdateArguments.*-SourceAgreementsAccepted\s+\$Script:SourceAgreementsAccepted'
+        $sourceText | Should -Match 'New-WingetSourceUpdateArguments'
+        $sourceText | Should -Not -Match 'SourceAgreementsAccepted'
         $listText | Should -Match 'New-WingetUpgradeListArguments.*-SourceAgreementsAccepted\s+\$Script:SourceAgreementsAccepted'
         $updateText | Should -Match '-SourceAgreementsAccepted\s+\$Script:SourceAgreementsAccepted'
         $scriptSource | Should -Not -Match '(?m)^\s*\$arguments\s*\+=\s*''--accept-source-agreements'''
@@ -1219,6 +1359,68 @@ Describe 'AI Session Failure Handoff' {
         $openText | Should -Match 'Resolve-WingetUpdaterAICliPath'
         $openText | Should -Match 'Start-WingetUpdaterAICliProcess'
         $openText | Should -Not -Match 'Start-Process.*-Verb\s+RunAs'
+    }
+
+    It 'restores ordinary unresolved package failures after post-update verification' {
+        $addRowText = Get-ScriptFunctionText -Name 'Add-PackageRow'
+
+        $addRowText | Should -Match 'Get-WingetUpdaterSessionFailure'
+        $addRowText | Should -Match "FailureType.*PackageUpgradeFailure"
+        $addRowText | Should -Match "Status.*Blad"
+    }
+
+    It 'preserves Ghost attempt counts independently from refresh count' {
+        $updateText = Get-ScriptFunctionText -Name 'Update-SelectedPackages'
+        $addRowText = Get-ScriptFunctionText -Name 'Add-PackageRow'
+
+        $updateText | Should -Match 'AttemptCount'
+        $addRowText | Should -Match 'AttemptCountOverride'
+    }
+
+    It 'opens a real cmd AI shim in the user profile without elevated or agent-control flags' -Skip:(-not $script:IsWindowsProcessTest) {
+        $fixtureSource = Join-Path $PSScriptRoot 'fixtures\fake-ai-cli.cmd'
+        Test-Path -LiteralPath $fixtureSource -PathType Leaf | Should -BeTrue
+
+        $localDirectory = Join-Path $env:TEMP ("WingetUpdater-AI-" + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $localDirectory -Force)
+        $fixturePath = Join-Path $localDirectory 'fake-ai-cli.cmd'
+        $markerPath = Join-Path $localDirectory 'invocation.txt'
+        Copy-Item -LiteralPath $fixtureSource -Destination $fixturePath
+        $oldMarker = $env:WINGETUPDATER_AI_FIXTURE_OUTPUT
+        try {
+            $env:WINGETUPDATER_AI_FIXTURE_OUTPUT = $markerPath
+            Start-WingetUpdaterAICliProcess -CliPath $fixturePath -CommandProcessorPath $env:ComSpec
+
+            $deadline = [datetime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $markerPath -PathType Leaf) -and [datetime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 100
+            }
+            Test-Path -LiteralPath $markerPath -PathType Leaf | Should -BeTrue
+            $invocation = [System.IO.File]::ReadAllText($markerPath)
+            $invocation | Should -Match ('(?m)^CWD=' + [regex]::Escape([Environment]::GetFolderPath('UserProfile')) + '\r?$')
+            $invocation | Should -Match '(?m)^ARGS=\s*\r?$'
+            $invocation | Should -Not -Match '(?i)(approval|sandbox|model|prompt|RunAs)'
+
+            $processDeadline = [datetime]::UtcNow.AddSeconds(10)
+            do {
+                $fixtureProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Name -eq 'cmd.exe' -and [string]$_.CommandLine -like "*$fixturePath*"
+                })
+                if ($fixtureProcesses.Count -gt 0) {
+                    Start-Sleep -Milliseconds 100
+                }
+            } while ($fixtureProcesses.Count -gt 0 -and [datetime]::UtcNow -lt $processDeadline)
+            $fixtureProcesses.Count | Should -Be 0
+        }
+        finally {
+            foreach ($fixtureProcess in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -eq 'cmd.exe' -and [string]$_.CommandLine -like "*$fixturePath*"
+            })) {
+                Stop-Process -Id $fixtureProcess.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            $env:WINGETUPDATER_AI_FIXTURE_OUTPUT = $oldMarker
+            Remove-Item -LiteralPath $localDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

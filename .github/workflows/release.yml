@@ -6,41 +6,104 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
-    name: Build & Publish Release
+  validate:
+    name: Validate (${{ matrix.shell }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - name: Checkout tagged source
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          fetch-depth: 0
 
-      - name: Install Pester & PSScriptAnalyzer
-        shell: pwsh
+      - name: Install pinned PowerShell modules
         run: |
           Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
-          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.22.0 -Scope CurrentUser -Force
-          Install-Module -Name Pester -RequiredVersion 5.6.1 -Scope CurrentUser -Force
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module -Name Pester -RequiredVersion 6.0.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run PSScriptAnalyzer
+        run: |
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -ErrorAction Stop
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          if ($results.Count -gt 0) {
+              $results | Format-Table -AutoSize
+              throw 'PSScriptAnalyzer found issues.'
+          }
 
       - name: Run Pester tests
-        shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.0.0 -Force
+          Import-Module Pester -RequiredVersion 6.0.1 -Force -ErrorAction Stop
           $config = [PesterConfiguration]::Default
           $config.Run.Path = './tests'
           $config.Output.Verbosity = 'Detailed'
           $config.Run.Exit = $true
           Invoke-Pester -Configuration $config
 
-      - name: Package Release ZIP & SHA256SUMS
+  package:
+    name: Validate tag and package release
+    needs: validate
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          fetch-depth: 0
+
+      - name: Verify annotated tag and version consistency
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+              throw "Release tag is not strict Semantic Versioning: $tag"
+          }
+          $tagType = (git cat-file -t $tag).Trim()
+          if ($tagType -ne 'tag') {
+              throw "Release tag must be annotated; object type was '$tagType'."
+          }
+          $tagCommit = (git rev-list -n 1 $tag).Trim()
+          $headCommit = (git rev-parse HEAD).Trim()
+          if ($tagCommit -ne $headCommit) {
+              throw 'The checked-out commit does not match the annotated release tag.'
+          }
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to fetch origin/main for release ancestry verification.'
+          }
+          git merge-base --is-ancestor $tagCommit origin/main
+          if ($LASTEXITCODE -ne 0) {
+              throw 'The release tag commit is not reachable from origin/main.'
+          }
+
+          $version = $tag.Substring(1)
+          $escapedVersion = [regex]::Escape($version)
+          $readme = Get-Content -LiteralPath README.md -Raw
+          $changelog = Get-Content -LiteralPath CHANGELOG.md -Raw
+          $application = Get-Content -LiteralPath WingetUpdater.ps1 -Raw
+          if ($readme -notmatch "(?m)^\*\*Version:\*\*\s+$escapedVersion\s*$" -or
+              $changelog -notmatch "(?m)^## \[$escapedVersion\] - \d{4}-\d{2}-\d{2}\s*$" -or
+              $application -notmatch "Wersja $escapedVersion") {
+              throw "README, CHANGELOG, application, and tag versions are not all $version."
+          }
+
+      - name: Build and verify release archive
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
           $zipName = "WingetUpdater-$tag.zip"
-          $stagingDir = Join-Path $env:RUNNER_TEMP "release-staging"
-          [void](New-Item -ItemType Directory -Path $stagingDir -Force)
 
           $files = @(
               'Start.bat',
@@ -50,26 +113,117 @@ jobs:
               'CHANGELOG.md',
               'LICENSE'
           )
-
           foreach ($file in $files) {
-              if (-not (Test-Path -LiteralPath $file)) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
                   throw "Missing required release file: $file"
               }
-              Copy-Item -LiteralPath $file -Destination $stagingDir
           }
 
-          Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipName -Force
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $commitEpoch = [long]((git show -s --format=%ct HEAD).Trim())
+          $releaseTimestamp = [DateTimeOffset]::FromUnixTimeSeconds($commitEpoch)
+          $zipPath = Join-Path (Get-Location) $zipName
+          $zipStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+          try {
+              $archive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+              try {
+                  foreach ($file in @($files | Sort-Object)) {
+                      $entry = $archive.CreateEntry($file, [System.IO.Compression.CompressionLevel]::Optimal)
+                      $entry.LastWriteTime = $releaseTimestamp
+                      $sourceStream = [System.IO.File]::OpenRead((Resolve-Path $file).Path)
+                      try {
+                          $entryStream = $entry.Open()
+                          try {
+                              $sourceStream.CopyTo($entryStream)
+                          }
+                          finally {
+                              $entryStream.Dispose()
+                          }
+                      }
+                      finally {
+                          $sourceStream.Dispose()
+                      }
+                  }
+              }
+              finally {
+                  $archive.Dispose()
+              }
+          }
+          finally {
+              $zipStream.Dispose()
+          }
 
-          $hash = (Get-FileHash -Path $zipName -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zipName" | Out-File -FilePath SHA256SUMS -Encoding utf8
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipName))
+          try {
+              $entries = @($archive.Entries | Where-Object { $_.Name } | ForEach-Object FullName | Sort-Object)
+          }
+          finally {
+              $archive.Dispose()
+          }
+          $expected = @($files | Sort-Object)
+          if (@(Compare-Object -ReferenceObject $expected -DifferenceObject $entries).Count -gt 0) {
+              throw "Unexpected release archive entries: $($entries -join ', ')"
+          }
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+          $hash = (Get-FileHash -Path $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText('SHA256SUMS', "$hash  $zipName`n", (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Upload validated release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-
-          files: |
+          name: release-bundle
+          path: |
             WingetUpdater-*.zip
             SHA256SUMS
-          draft: false
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attest and publish release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download validated release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: release
+
+      - name: Verify downloaded checksum
+        shell: pwsh
+        run: |
+          $line = (Get-Content -LiteralPath release/SHA256SUMS -Raw).Trim()
+          $parts = $line -split '\s+', 2
+          if ($parts.Count -ne 2) { throw 'Invalid SHA256SUMS format.' }
+          $zipPath = Join-Path release $parts[1]
+          $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $parts[0]) { throw 'Downloaded release bundle checksum mismatch.' }
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            release/WingetUpdater-*.zip
+            release/SHA256SUMS
+
+      - name: Upload draft release assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            release/WingetUpdater-*.zip
+            release/SHA256SUMS
+          draft: true
           prerelease: false
           generate_release_notes: true
+
+      - name: Publish immutable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft=false --latest

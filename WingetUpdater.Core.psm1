@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 Set-StrictMode -Version 2.0
 
@@ -192,18 +192,9 @@ function Test-WingetCapability {
 
 function New-WingetSourceUpdateArguments {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'This pure function only returns a string argument array.')]
-    param(
-        [object]$Capabilities,
-        [bool]$SourceAgreementsAccepted = $false
-    )
+    param()
 
-    $arguments = New-Object System.Collections.Generic.List[string]
-    [void]$arguments.Add('source')
-    [void]$arguments.Add('update')
-    if ($SourceAgreementsAccepted -and ((Test-WingetCapability -Capabilities $Capabilities -Name 'SupportsSourceUpdateAcceptSourceAgreements') -or (Test-WingetCapability -Capabilities $Capabilities -Name 'SupportsAcceptSourceAgreements'))) {
-        [void]$arguments.Add('--accept-source-agreements')
-    }
-    return $arguments.ToArray()
+    return @('source', 'update')
 }
 
 function New-WingetUpgradeListArguments {
@@ -1851,6 +1842,9 @@ function Initialize-WingetUpdaterStorage {
 }
 
 function New-WingetUpdaterSessionFailureRegistry {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates and returns only an in-memory dictionary.')]
+    param()
+
     return [ordered]@{}
 }
 
@@ -1870,10 +1864,14 @@ function Add-WingetUpdaterSessionFailure {
         [System.Collections.IDictionary]$Registry,
         [object]$Package,
         [object]$Result,
-        [string]$FailureType = 'PackageUpgradeFailure'
+        [string]$FailureType = 'PackageUpgradeFailure',
+        [AllowNull()][Nullable[int]]$AttemptCountOverride
     )
 
     if ($null -eq $Registry -or $null -eq $Package) {
+        return
+    }
+    if ($null -ne $Result -and $Result.PSObject.Properties['Cancelled'] -and [bool]$Result.Cancelled) {
         return
     }
 
@@ -1889,7 +1887,15 @@ function Add-WingetUpdaterSessionFailure {
         $previousAttemptCount = [int]$Registry[$key].AttemptCount
     }
 
-    $attemptCount = $previousAttemptCount + 1
+    $attemptCount = if ($null -ne $AttemptCountOverride) {
+        if ([int]$AttemptCountOverride -lt 1) {
+            throw 'Attempt count override must be greater than zero.'
+        }
+        [int]$AttemptCountOverride
+    }
+    else {
+        $previousAttemptCount + 1
+    }
 
     $name = if ($Package.PSObject.Properties['Name']) { [string]$Package.Name } else { '' }
     $currentVersion = if ($Package.PSObject.Properties['CurrentVersion']) { [string]$Package.CurrentVersion } else { '' }
@@ -1902,10 +1908,19 @@ function Add-WingetUpdaterSessionFailure {
     $standardError = ''
     $combinedOutput = ''
     $logPath = ''
+    $startedAtUtc = $null
+    $endedAtUtc = $null
 
     if ($null -ne $Result) {
         if ($Result.PSObject.Properties['ExitCode']) { $exitCode = $Result.ExitCode }
-        if ($Result.PSObject.Properties['DisplayArguments']) { $displayArguments = [string]$Result.DisplayArguments }
+        if ($Result.PSObject.Properties['DisplayCommand']) {
+            $displayArguments = [string]$Result.DisplayCommand
+        }
+        elseif ($Result.PSObject.Properties['DisplayArguments']) {
+            $displayArguments = [string]$Result.DisplayArguments
+        }
+        if ($Result.PSObject.Properties['StartedAtUtc'] -and $null -ne $Result.StartedAtUtc) { $startedAtUtc = [datetime]$Result.StartedAtUtc }
+        if ($Result.PSObject.Properties['EndedAtUtc'] -and $null -ne $Result.EndedAtUtc) { $endedAtUtc = [datetime]$Result.EndedAtUtc }
         if ($Result.PSObject.Properties['StandardOutput']) { $standardOutput = [string]$Result.StandardOutput }
         if ($Result.PSObject.Properties['StandardError']) { $standardError = [string]$Result.StandardError }
         if ($Result.PSObject.Properties['CombinedOutput']) { $combinedOutput = [string]$Result.CombinedOutput }
@@ -1923,6 +1938,8 @@ function Add-WingetUpdaterSessionFailure {
         FailureType = $FailureType
         AttemptCount = $attemptCount
         TimestampUtc = [datetime]::UtcNow
+        StartedAtUtc = $startedAtUtc
+        EndedAtUtc = $endedAtUtc
         ExitCode = $exitCode
         DisplayArguments = $displayArguments
         StandardOutput = $standardOutput
@@ -1934,7 +1951,26 @@ function Add-WingetUpdaterSessionFailure {
     $Registry[$key] = $record
 }
 
+function Get-WingetUpdaterSessionFailure {
+    param(
+        [System.Collections.IDictionary]$Registry,
+        [string]$Id,
+        [string]$Source
+    )
+
+    if ($null -eq $Registry -or [string]::IsNullOrWhiteSpace($Id)) {
+        return $null
+    }
+
+    $key = Get-WingetUpdaterPackageKey -Id $Id -Source $Source
+    if ($Registry.Contains($key)) {
+        return $Registry[$key]
+    }
+    return $null
+}
+
 function Remove-WingetUpdaterSessionFailure {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Mutates only the caller-owned in-memory session registry.')]
     param(
         [System.Collections.IDictionary]$Registry,
         [string]$Id,
@@ -1983,6 +2019,7 @@ function Get-WingetUpdaterSessionFailures {
 }
 
 function New-WingetUpdaterRepairContextFile {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string]$Directory,
         [object[]]$Failures
@@ -1991,9 +2028,6 @@ function New-WingetUpdaterRepairContextFile {
     if ([string]::IsNullOrWhiteSpace($Directory)) {
         throw 'Context directory cannot be empty.'
     }
-    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $Directory -Force -ErrorAction Stop)
-    }
     if ($null -eq $Failures -or $Failures.Count -eq 0) {
         throw 'No failures provided for context generation.'
     }
@@ -2001,6 +2035,12 @@ function New-WingetUpdaterRepairContextFile {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $filename = "repair-context-$stamp-$([guid]::NewGuid().ToString('N')).txt"
     $filePath = Join-Path $Directory $filename
+    if (-not $PSCmdlet.ShouldProcess($filePath, 'Create AI repair context')) {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $Directory -Force -ErrorAction Stop)
+    }
 
     $lines = New-Object System.Collections.Generic.List[string]
     [void]$lines.Add('=== WingetUpdater AI Repair Context ===')
@@ -2015,6 +2055,10 @@ function New-WingetUpdaterRepairContextFile {
         [void]$lines.Add("Available Version: $($f.AvailableVersion)")
         [void]$lines.Add("Failure Type: $($f.FailureType)")
         [void]$lines.Add("Attempt Count: $($f.AttemptCount)")
+        $startedAtText = if ($null -ne $f.StartedAtUtc) { ([datetime]$f.StartedAtUtc).ToString('o') } else { '' }
+        $endedAtText = if ($null -ne $f.EndedAtUtc) { ([datetime]$f.EndedAtUtc).ToString('o') } else { '' }
+        [void]$lines.Add("Started At UTC: $startedAtText")
+        [void]$lines.Add("Ended At UTC: $endedAtText")
         [void]$lines.Add("Exit Code: $($f.ExitCode)")
         [void]$lines.Add("Command Line: $($f.DisplayArguments)")
         [void]$lines.Add("Log File: $($f.LogPath)")
@@ -2047,26 +2091,67 @@ function Resolve-WingetUpdaterAICliPath {
         throw "Unsupported AI CLI: $CliName"
     }
 
-    $cmd = Get-Command -Name $CliName -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) {
-        return $cmd.Source
+    $commands = @(Get-Command -Name $CliName -All -ErrorAction SilentlyContinue)
+    foreach ($cmd in $commands) {
+        if ($null -eq $cmd -or [string]$cmd.CommandType -ne 'Application') {
+            continue
+        }
+
+        $source = [string]$cmd.Source
+        $isAbsolute = [System.IO.Path]::IsPathRooted($source) -or $source -match '^[A-Za-z]:[\\/]'
+        $extension = [System.IO.Path]::GetExtension($source).ToLowerInvariant()
+        if (-not $isAbsolute -or $extension -notin @('.exe', '.cmd')) {
+            continue
+        }
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            return $source
+        }
     }
 
     return $null
 }
 
 function Start-WingetUpdaterAICliProcess {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
-        [string]$CliPath
+        [string]$CliPath,
+        [string]$CommandProcessorPath
     )
 
     if ([string]::IsNullOrWhiteSpace($CliPath)) {
         throw 'CLI executable path cannot be empty.'
     }
 
+    $isAbsolute = [System.IO.Path]::IsPathRooted($CliPath) -or $CliPath -match '^[A-Za-z]:[\\/]'
+    $extension = [System.IO.Path]::GetExtension($CliPath).ToLowerInvariant()
+    if (-not $isAbsolute -or $extension -notin @('.exe', '.cmd') -or -not (Test-Path -LiteralPath $CliPath -PathType Leaf)) {
+        throw "CLI path must be an existing absolute .exe or .cmd file: $CliPath"
+    }
+
     $userProfile = [Environment]::GetFolderPath('UserProfile')
-    $cmd = Get-Command -Name cmd.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    Start-Process -FilePath $cmd.Source -ArgumentList "/c start `"$CliPath`"" -WorkingDirectory $userProfile
+    if ($extension -eq '.exe') {
+        if ($PSCmdlet.ShouldProcess($CliPath, 'Open AI CLI in a normal-privilege console')) {
+            Start-Process -FilePath $CliPath -WorkingDirectory $userProfile
+        }
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($CommandProcessorPath)) {
+        $systemRoot = [Environment]::GetEnvironmentVariable('SystemRoot')
+        if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+            throw 'SystemRoot is unavailable; cannot resolve the command processor.'
+        }
+        $CommandProcessorPath = Join-Path $systemRoot 'System32\cmd.exe'
+    }
+    $isCommandProcessorAbsolute = [System.IO.Path]::IsPathRooted($CommandProcessorPath) -or $CommandProcessorPath -match '^[A-Za-z]:[\\/]'
+    if (-not $isCommandProcessorAbsolute -or -not (Test-Path -LiteralPath $CommandProcessorPath -PathType Leaf)) {
+        throw "Trusted command processor was not found: $CommandProcessorPath"
+    }
+
+    $arguments = "/d /c start `"`" `"$CliPath`""
+    if ($PSCmdlet.ShouldProcess($CliPath, 'Open AI CLI command shim in a normal-privilege console')) {
+        Start-Process -FilePath $CommandProcessorPath -ArgumentList $arguments -WorkingDirectory $userProfile
+    }
 }
 
 Export-ModuleMember -Function @(
@@ -2102,6 +2187,7 @@ Export-ModuleMember -Function @(
     'New-WingetUpdaterSessionFailureRegistry'
     'Get-WingetUpdaterPackageKey'
     'Add-WingetUpdaterSessionFailure'
+    'Get-WingetUpdaterSessionFailure'
     'Remove-WingetUpdaterSessionFailure'
     'Get-WingetUpdaterSessionFailures'
     'New-WingetUpdaterRepairContextFile'
