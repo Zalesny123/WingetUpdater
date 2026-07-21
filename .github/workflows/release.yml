@@ -27,6 +27,7 @@ jobs:
       - name: Run Pester tests
         shell: pwsh
         run: |
+          Import-Module Pester -MinimumVersion 5.0.0 -Force
           $config = [PesterConfiguration]::Default
           $config.Run.Path = './tests'
           $config.Output.Verbosity = 'Detailed'
