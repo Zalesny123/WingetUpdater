@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.2] - 2026-07-21
+
+### Fixed
+- Fixed empty settings path error (`Settings path is empty.`) during source agreement confirmation by binding `$settingsFile` in `Confirm-SourceAgreements` closure.
+
 ## [1.0.1] - 2026-07-21
 
 ### Security

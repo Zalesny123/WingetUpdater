@@ -1045,7 +1045,7 @@ $internalApply = Apply-SkipListToVisiblePackages -Silent -BypassBusyGuard
 
         $consentText | Should -Match 'Resolve-WingetUpdaterSourceAgreementConsent'
         $consentText | Should -Match '\$Script:TestModeCheck\.Checked'
-        $consentText | Should -Match 'Grant-WingetUpdaterSourceAgreements\s+-Path\s+\$Script:Paths\.SettingsFile'
+        $consentText | Should -Match 'Grant-WingetUpdaterSourceAgreements\s+-Path\s+\$settingsFile'
         $consentText | Should -Match 'pelny dostep.*Odswiez.*Mock'
         $refreshText | Should -Match '(?s)if\s*\(-not\s+\(Confirm-SourceAgreements\)\).*?return'
         $refreshText.IndexOf('Confirm-SourceAgreements') | Should -BeLessThan $refreshText.IndexOf('Initialize-WingetInfo')
