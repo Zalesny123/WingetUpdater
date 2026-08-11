@@ -280,7 +280,28 @@ jobs:
               return
           }
           if ($release.draft -eq $true) {
-              $draftAssetNames = @($release.assets | ForEach-Object name | Sort-Object)
+              $draftAssetErrorPath = Join-Path $env:RUNNER_TEMP "draft-assets-$([guid]::NewGuid().ToString('N')).txt"
+              $draftAssetPagesJson = gh api --paginate --slurp "repos/$env:REPOSITORY/releases/$($release.id)/assets?per_page=100" 2> $draftAssetErrorPath
+              $draftAssetExitCode = $LASTEXITCODE
+              if ($draftAssetExitCode -ne 0) {
+                  $draftAssetError = if (Test-Path -LiteralPath $draftAssetErrorPath) {
+                      [System.IO.File]::ReadAllText($draftAssetErrorPath)
+                  }
+                  else {
+                      ''
+                  }
+                  throw "Unable to inspect draft release assets: $draftAssetError"
+              }
+
+              $draftAssetPages = ConvertFrom-Json -InputObject ($draftAssetPagesJson -join "`n") -ErrorAction Stop
+              $draftAssets = @(
+                  foreach ($page in @($draftAssetPages)) {
+                      foreach ($asset in @($page)) {
+                          $asset
+                      }
+                  }
+              )
+              $draftAssetNames = @($draftAssets | ForEach-Object name | Sort-Object)
               $unexpectedDraftAssets = @($draftAssetNames | Where-Object { $_ -cnotin $expectedNames })
               if ($unexpectedDraftAssets.Count -gt 0) {
                   throw "Draft release has unexpected assets: $($unexpectedDraftAssets -join ', ')"

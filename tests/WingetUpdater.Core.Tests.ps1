@@ -1545,6 +1545,34 @@ Describe 'Release Package Manifest' {
         $runBlocks.Count | Should -Be 1
         $commandText = & $getRunCommandText $runBlocks[0]
 
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $commandText,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $commandLines = @($ast.FindAll({
+            param($node)
+
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true) | ForEach-Object { $_.Extent.Text.Trim() })
+        $draftAssetQueries = @($commandLines | Where-Object {
+            $_ -match '(?i)^gh(?:\.exe)?[ \t]+api\b' -and
+                $_ -match '--paginate\b' -and
+                $_ -match '--slurp\b' -and
+                $_ -match 'repos/\$env:REPOSITORY/releases/\$\(\$release\.id\)/assets\?per_page=100'
+        })
+        $draftAssetQueries.Count | Should -Be 1
+
+        $draftBranchIndex = $commandText.IndexOf('if ($release.draft -eq $true)')
+        $draftOutputIndex = $commandText.IndexOf('state=draft')
+        $draftBranchIndex | Should -BeGreaterOrEqual 0
+        $draftOutputIndex | Should -BeGreaterThan $draftBranchIndex
+        $draftBranchText = $commandText.Substring($draftBranchIndex, $draftOutputIndex - $draftBranchIndex)
+        $draftBranchText | Should -Not -Match '\$release\.assets\b'
+
         $expectedNamesAssignment = [regex]::Match(
             $commandText,
             '(?m)^[ \t]*\$expectedNames\s*=\s*@\((?<names>[^\r\n]+)\)[ \t]*\|[ \t]*Sort-Object[ \t]*$'
@@ -1553,9 +1581,36 @@ Describe 'Release Package Manifest' {
         @($expectedNamesAssignment.Groups['names'].Value -split ',' | ForEach-Object { $_.Trim() }) |
             Should -Be @("'SHA256SUMS'", '$expectedZip')
 
+        $queryIndex = $commandText.IndexOf($draftAssetQueries[0])
+        $exitCodeAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$draftAssetExitCode\s*=\s*\$LASTEXITCODE[ \t]*$'
+        )
+        $exitCodeAssignment.Success | Should -BeTrue
+        $exitCodeGuard = [regex]::Match(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$draftAssetExitCode[ \t]+-ne[ \t]+0[ \t]*\)[ \t]*\{'
+        )
+        $exitCodeGuard.Success | Should -BeTrue
+        $draftAssetPagesAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$draftAssetPages\s*=\s*ConvertFrom-Json[ \t]+-InputObject[ \t]+\(\$draftAssetPagesJson[ \t]+-join[ \t]+"`n"\)[ \t]+-ErrorAction[ \t]+Stop[ \t]*$'
+        )
+        $draftAssetPagesAssignment.Success | Should -BeTrue
+        $apiErrorBranch = $commandText.Substring(
+            $exitCodeGuard.Index,
+            $draftAssetPagesAssignment.Index - $exitCodeGuard.Index
+        )
+        $apiErrorBranch | Should -Match '(?mi)^[ \t]*throw\b'
+
+        $flattenedAssetsAssignment = [regex]::Match(
+            $commandText,
+            '(?ms)^[ \t]*\$draftAssets\s*=\s*@\([ \t]*\r?\n[ \t]+foreach[ \t]*\([ \t]*\$page[ \t]+in[ \t]+@\(\$draftAssetPages\)[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+foreach[ \t]*\([ \t]*\$asset[ \t]+in[ \t]+@\(\$page\)[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+\$asset[ \t]*\r?\n[ \t]*\}[ \t]*\r?\n[ \t]*\}[ \t]*\r?\n[ \t]*\)[ \t]*$'
+        )
+        $flattenedAssetsAssignment.Success | Should -BeTrue
         $draftAssetAssignment = [regex]::Match(
             $commandText,
-            '(?m)^[ \t]*\$draftAssetNames\s*=\s*@\(\$release\.assets[ \t]*\|[ \t]*ForEach-Object[ \t]+name[ \t]*\|[ \t]*Sort-Object\)[ \t]*$'
+            '(?m)^[ \t]*\$draftAssetNames\s*=\s*@\(\$draftAssets[ \t]*\|[ \t]*ForEach-Object[ \t]+name[ \t]*\|[ \t]*Sort-Object\)[ \t]*$'
         )
         $draftAssetAssignment.Success | Should -BeTrue
         $unexpectedAssetAssignment = [regex]::Match(
@@ -1569,8 +1624,12 @@ Describe 'Release Package Manifest' {
         )
         $unexpectedAssetGuards.Count | Should -Be 1
 
-        $draftOutputIndex = $commandText.IndexOf('state=draft')
-        $expectedNamesAssignment.Index | Should -BeLessThan $draftAssetAssignment.Index
+        $queryIndex | Should -BeGreaterThan $draftBranchIndex
+        $queryIndex | Should -BeLessThan $exitCodeAssignment.Index
+        $exitCodeAssignment.Index | Should -BeLessThan $exitCodeGuard.Index
+        $exitCodeGuard.Index | Should -BeLessThan $draftAssetPagesAssignment.Index
+        $draftAssetPagesAssignment.Index | Should -BeLessThan $flattenedAssetsAssignment.Index
+        $flattenedAssetsAssignment.Index | Should -BeLessThan $draftAssetAssignment.Index
         $draftAssetAssignment.Index | Should -BeLessThan $unexpectedAssetAssignment.Index
         $unexpectedAssetAssignment.Index | Should -BeLessThan $unexpectedAssetGuards[0].Index
         $unexpectedAssetGuards[0].Index | Should -BeLessThan $draftOutputIndex
