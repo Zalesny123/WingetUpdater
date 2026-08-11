@@ -1601,6 +1601,27 @@ Describe 'Release Package Manifest' {
         $publishedIndex | Should -BeGreaterThan $hashIndex
     }
 
+    It 'normalizes both published release hashes before checksum comparison' {
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseStateSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {8}id:[ \t]*release-state[ \t]*$'
+        })
+        $releaseStateSteps.Count | Should -Be 1
+        $runBlocks = @(& $getYamlBlocks $releaseStateSteps[0].Value 8 'run')
+        $runBlocks.Count | Should -Be 1
+        $commandText = & $getRunCommandText $runBlocks[0]
+
+        $commandText | Should -Match '(?m)^[ \t]*\$expectedHash\s*=\s*\$checksumMatch\.Groups\[[''"]hash[''"]\]\.Value\.ToLowerInvariant\(\)[ \t]*$'
+        $commandText | Should -Match '(?m)^[ \t]*\$actualHash\s*=\s*\(Get-FileHash\b[^\r\n]*-Algorithm[ \t]+SHA256\)\.Hash\.ToLowerInvariant\(\)[ \t]*$'
+        $hashComparisons = [regex]::Matches(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$actualHash[ \t]+-ne[ \t]+\$expectedHash[ \t]*\)[ \t]*\{'
+        )
+        $hashComparisons.Count | Should -Be 1
+        $commandText | Should -Not -Match '(?i)\$actualHash\s+-cne\s+'
+        $commandText.IndexOf('state=published') | Should -BeGreaterThan $hashComparisons[0].Index
+    }
+
     It 'keeps every GitHub Action pinned to a full commit SHA' {
         $actionReferences = [regex]::Matches($ciWorkflow + "`n" + $releaseWorkflow, 'uses:\s*[^\s]+@(?<ref>[^\s#]+)')
         $actionReferences.Count | Should -BeGreaterThan 0

@@ -312,8 +312,9 @@ jobs:
           }
 
           $publishedZipPath = Join-Path $verificationDirectory $expectedZip
-          $actualHash = (Get-FileHash -LiteralPath $publishedZipPath -Algorithm SHA256).Hash
-          if ($actualHash -cne $checksumMatch.Groups['hash'].Value) {
+          $expectedHash = $checksumMatch.Groups['hash'].Value.ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $publishedZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
               throw 'Published release archive checksum mismatch.'
           }
 
