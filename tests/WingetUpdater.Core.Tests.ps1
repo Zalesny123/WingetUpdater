@@ -1285,6 +1285,16 @@ Describe 'Release Package Manifest' {
                 ':[^\r\n]*(?:\r?\n(?:' + (' ' * ($Indent + 2)) + '[^\r\n]*|[ \t]*$))*'
             [regex]::Matches($Text, $pattern) | ForEach-Object { $_ }
         }
+        $getYamlChildBlocks = {
+            param(
+                [string]$Text,
+                [int]$Indent
+            )
+
+            $pattern = '(?m)^' + (' ' * $Indent) + '(?<key>[A-Za-z_][A-Za-z0-9_-]*)' +
+                ':[^\r\n]*(?:\r?\n(?:' + (' ' * ($Indent + 2)) + '[^\r\n]*|[ \t]*$))*'
+            [regex]::Matches($Text, $pattern) | ForEach-Object { $_ }
+        }
         $getWorkflowSteps = {
             param([string]$Text)
 
@@ -1296,6 +1306,53 @@ Describe 'Release Package Manifest' {
                     ) | ForEach-Object { $_ }
                 }
             }
+        }
+        $getRunCommandText = {
+            param([System.Text.RegularExpressions.Match]$RunBlock)
+
+            $lines = [regex]::Split($RunBlock.Value, '\r?\n')
+            $header = [regex]::Match($lines[0], '^ {8}run:[ \t]*(?<value>.*)$')
+            $value = $header.Groups['value'].Value.Trim()
+            if ($value -match '^[|>][+-]?(?:[ \t]+#.*)?$') {
+                $bodyLines = @(
+                    foreach ($line in @($lines | Select-Object -Skip 1)) {
+                        if ($line.StartsWith('          ')) {
+                            $line.Substring(10)
+                        }
+                        else {
+                            $line
+                        }
+                    }
+                )
+                return ($bodyLines -join "`n")
+            }
+
+            if ($value.Length -ge 2 -and $value[0] -eq "'" -and $value[$value.Length - 1] -eq "'") {
+                return $value.Substring(1, $value.Length - 2).Replace("''", "'")
+            }
+            if ($value.Length -ge 2 -and $value[0] -eq '"' -and $value[$value.Length - 1] -eq '"') {
+                return $value.Substring(1, $value.Length - 2).Replace('\"', '"')
+            }
+            return $value
+        }
+        $getTagAssignments = {
+            param([string]$CommandText)
+
+            $tokens = $null
+            $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+                $CommandText,
+                [ref]$tokens,
+                [ref]$parseErrors
+            )
+            $ast.FindAll({
+                param($node)
+
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals -and
+                    $node.Left.Extent.Text.Trim() -ieq '$tag' -and
+                    $node.Right.Extent.Text.Trim() -ieq '$env:RELEASE_TAG'
+            }, $true)
         }
     }
 
@@ -1471,22 +1528,24 @@ Describe 'Release Package Manifest' {
 
         $ciJobsBlocks = @(& $getYamlBlocks $ciWorkflow 0 'jobs')
         $ciJobsBlocks.Count | Should -Be 1
-        $ciTestJobs = @(& $getYamlBlocks $ciJobsBlocks[0].Value 2 'test')
-        $ciTestJobs.Count | Should -Be 1
-        $ciTimeouts = [regex]::Matches(
-            $ciTestJobs[0].Value,
-            '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
-        )
-        $ciTimeouts.Count | Should -Be 1
-        $ciTimeouts[0].Groups['value'].Value.Trim() | Should -Be '20'
+        $ciJobs = @(& $getYamlChildBlocks $ciJobsBlocks[0].Value 2)
+        $ciJobs.Count | Should -BeGreaterThan 0
+        foreach ($ciJob in $ciJobs) {
+            $ciTimeouts = [regex]::Matches(
+                $ciJob.Value,
+                '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            )
+            $ciTimeouts.Count | Should -Be 1
+            $ciTimeouts[0].Groups['value'].Value.Trim() | Should -Be '20'
+        }
 
         $releaseJobsBlocks = @(& $getYamlBlocks $releaseWorkflow 0 'jobs')
         $releaseJobsBlocks.Count | Should -Be 1
-        foreach ($jobName in @('validate', 'package', 'publish')) {
-            $releaseJobs = @(& $getYamlBlocks $releaseJobsBlocks[0].Value 2 $jobName)
-            $releaseJobs.Count | Should -Be 1
+        $releaseJobs = @(& $getYamlChildBlocks $releaseJobsBlocks[0].Value 2)
+        $releaseJobs.Count | Should -BeGreaterThan 0
+        foreach ($releaseJob in $releaseJobs) {
             $jobTimeouts = [regex]::Matches(
-                $releaseJobs[0].Value,
+                $releaseJob.Value,
                 '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
             )
             $jobTimeouts.Count | Should -Be 1
@@ -1518,15 +1577,20 @@ Describe 'Release Package Manifest' {
         $releaseSteps.Count | Should -BeGreaterThan 0
         $releaseRunBlocks = @(
             foreach ($step in $releaseSteps) {
-                @(& $getYamlBlocks $step.Value 8 'run') | Where-Object {
-                    $_.Value -match '(?m)^ {8}run:[ \t]*\|[ \t]*(?:#.*)?$'
-                }
+                @(& $getYamlBlocks $step.Value 8 'run')
             }
         )
         $releaseRunBlocks.Count | Should -BeGreaterThan 0
         foreach ($runBlock in $releaseRunBlocks) {
             $runBlock.Value | Should -Not -Match '\$\{\{[ \t]*github\.(?:ref_name|repository)[ \t]*\}\}'
         }
+        $tagAssignments = @(
+            foreach ($runBlock in $releaseRunBlocks) {
+                $commandText = & $getRunCommandText $runBlock
+                @(& $getTagAssignments $commandText)
+            }
+        )
+        $tagAssignments.Count | Should -Be 2
 
         $releaseEnvBlocks = @(
             foreach ($step in $releaseSteps) {
@@ -1565,11 +1629,10 @@ Describe 'Release Package Manifest' {
                 $_.Value -match ('(?m)^ {6}-[ \t]*name:[ \t]*' + [regex]::Escape($stepName) + '[ \t]*$')
             })
             $tagSteps.Count | Should -Be 1
-            $tagRunBlocks = @(& $getYamlBlocks $tagSteps[0].Value 8 'run' | Where-Object {
-                $_.Value -match '(?m)^ {8}run:[ \t]*\|[ \t]*(?:#.*)?$'
-            })
+            $tagRunBlocks = @(& $getYamlBlocks $tagSteps[0].Value 8 'run')
             $tagRunBlocks.Count | Should -Be 1
-            $tagRunBlocks[0].Value | Should -Match '\$env:RELEASE_TAG\b'
+            $tagCommandText = & $getRunCommandText $tagRunBlocks[0]
+            @(& $getTagAssignments $tagCommandText).Count | Should -Be 1
             $tagEnvBlocks = @(& $getYamlBlocks $tagSteps[0].Value 8 'env')
             $tagEnvBlocks.Count | Should -Be 1
             $tagEnvDeclarations = [regex]::Matches(
@@ -1585,9 +1648,7 @@ Describe 'Release Package Manifest' {
             $_.Value -match '(?m)^ {6}-[ \t]*name:[ \t]*Publish immutable GitHub Release[ \t]*$'
         })
         $publishSteps.Count | Should -Be 1
-        $publishRunBlocks = @(& $getYamlBlocks $publishSteps[0].Value 8 'run' | Where-Object {
-            $_.Value -match '(?m)^ {8}run:[ \t]*\|[ \t]*(?:#.*)?$'
-        })
+        $publishRunBlocks = @(& $getYamlBlocks $publishSteps[0].Value 8 'run')
         $publishRunBlocks.Count | Should -Be 1
         $publishEnvBlocks = @(& $getYamlBlocks $publishSteps[0].Value 8 'env')
         $publishEnvBlocks.Count | Should -Be 1
@@ -1605,8 +1666,9 @@ Describe 'Release Package Manifest' {
         $publishRepositoryDeclarations.Count | Should -Be 1
         $publishRepositoryDeclarations[0].Groups['value'].Value.Trim() |
             Should -Be '${{ github.repository }}'
+        $publishCommandText = & $getRunCommandText $publishRunBlocks[0]
         $publishCommand = [regex]::Match(
-            $publishRunBlocks[0].Value,
+            $publishCommandText,
             '(?mi)^[ \t]*(?:&[ \t]+)?gh(?:\.exe)?[ \t]+release[ \t]+edit\b[^\r\n]*$'
         )
         $publishCommand.Success | Should -BeTrue
