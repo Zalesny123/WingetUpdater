@@ -1331,8 +1331,10 @@ Describe 'Release Package Manifest' {
         $releaseWorkflow | Should -Match 'shell:\s*\[pwsh, powershell\]'
         $releaseWorkflow | Should -Match 'Invoke-ScriptAnalyzer'
         $releaseWorkflow | Should -Match 'Invoke-Pester'
-        $releaseWorkflow | Should -Match 'actions/attest-build-provenance@[0-9a-f]{40}'
+        $releaseWorkflow | Should -Match 'actions/attest@[0-9a-f]{40}'
+        $releaseWorkflow | Should -Not -Match 'actions/attest-build-provenance@'
         $releaseWorkflow | Should -Match 'attestations:\s*write'
+        $releaseWorkflow | Should -Match 'artifact-metadata:\s*write'
         $releaseWorkflow | Should -Match 'id-token:\s*write'
     }
 
@@ -1360,6 +1362,39 @@ Describe 'Release Package Manifest' {
         foreach ($reference in $actionReferences) {
             $reference.Groups['ref'].Value | Should -Match '^[0-9a-f]{40}$'
         }
+    }
+
+    It 'pins the current Node.js 24 release actions to verified commits' {
+        $expectedActions = @(
+            'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a',
+            'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
+            'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6',
+            'softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228'
+        )
+
+        foreach ($action in $expectedActions) {
+            $releaseWorkflow | Should -Match ([regex]::Escape($action))
+        }
+    }
+
+    It 'bounds workflow execution and does not persist checkout credentials' {
+        $ciWorkflow | Should -Match '(?s)concurrency:.*cancel-in-progress:\s*true'
+        $releaseWorkflow | Should -Match '(?s)concurrency:.*cancel-in-progress:\s*false'
+        $ciWorkflow | Should -Match 'timeout-minutes:\s*20'
+        ([regex]::Matches($releaseWorkflow, 'timeout-minutes:\s*(10|20)')).Count | Should -Be 3
+
+        $combinedWorkflow = $ciWorkflow + "`n" + $releaseWorkflow
+        $checkoutCount = [regex]::Matches($combinedWorkflow, 'uses:\s*actions/checkout@').Count
+        $credentialCount = [regex]::Matches($combinedWorkflow, 'persist-credentials:\s*false').Count
+        $credentialCount | Should -Be $checkoutCount
+    }
+
+    It 'isolates GitHub context from release PowerShell scripts and validates asset globs' {
+        ([regex]::Matches($releaseWorkflow, 'RELEASE_TAG:\s*\$\{\{\s*github\.ref_name\s*\}\}')).Count | Should -Be 3
+        $releaseWorkflow | Should -Match 'REPOSITORY:\s*\$\{\{\s*github\.repository\s*\}\}'
+        $releaseWorkflow | Should -Not -Match '\$tag\s*=\s*''\$\{\{\s*github\.ref_name'
+        $releaseWorkflow | Should -Not -Match 'gh\s+release\s+edit\s+''\$\{\{'
+        $releaseWorkflow | Should -Match 'fail_on_unmatched_files:\s*true'
     }
 
     It 'pins the native Node.js 24 checkout action to the verified v7 commit' {
