@@ -1331,8 +1331,8 @@ Describe 'Release Package Manifest' {
         $releaseWorkflow | Should -Match 'shell:\s*\[pwsh, powershell\]'
         $releaseWorkflow | Should -Match 'Invoke-ScriptAnalyzer'
         $releaseWorkflow | Should -Match 'Invoke-Pester'
-        $releaseWorkflow | Should -Match 'actions/attest@[0-9a-f]{40}'
-        $releaseWorkflow | Should -Not -Match 'actions/attest-build-provenance@'
+        $releaseWorkflow | Should -Match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*actions/attest@[0-9a-f]{40}(?:[ \t]+#.*)?[ \t]*$'
+        $releaseWorkflow | Should -Not -Match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*actions/attest-build-provenance@'
         $releaseWorkflow | Should -Match 'attestations:\s*write'
         $releaseWorkflow | Should -Match 'artifact-metadata:\s*write'
         $releaseWorkflow | Should -Match 'id-token:\s*write'
@@ -1373,27 +1373,97 @@ Describe 'Release Package Manifest' {
         )
 
         foreach ($action in $expectedActions) {
-            $releaseWorkflow | Should -Match ([regex]::Escape($action))
+            $usesPattern = '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*' +
+                [regex]::Escape($action) + '(?:[ \t]+#.*)?[ \t]*$'
+            $releaseWorkflow | Should -Match $usesPattern
         }
     }
 
     It 'bounds workflow execution and does not persist checkout credentials' {
-        $ciWorkflow | Should -Match '(?s)concurrency:.*cancel-in-progress:\s*true'
-        $releaseWorkflow | Should -Match '(?s)concurrency:.*cancel-in-progress:\s*false'
-        $ciWorkflow | Should -Match 'timeout-minutes:\s*20'
-        ([regex]::Matches($releaseWorkflow, 'timeout-minutes:\s*(10|20)')).Count | Should -Be 3
+        $workflowExpectations = @(
+            [pscustomobject]@{ Text = $ciWorkflow; CancelInProgress = 'true' },
+            [pscustomobject]@{ Text = $releaseWorkflow; CancelInProgress = 'false' }
+        )
+        foreach ($workflow in $workflowExpectations) {
+            $concurrencyBlocks = [regex]::Matches(
+                $workflow.Text,
+                '(?m)^concurrency:[^\r\n]*(?:\r?\n(?:[ \t]+[^\r\n]*|[ \t]*$))*'
+            )
+            $concurrencyBlocks.Count | Should -Be 1
+            $cancelDeclarations = [regex]::Matches(
+                $concurrencyBlocks[0].Value,
+                '(?m)^  cancel-in-progress[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            )
+            $cancelDeclarations.Count | Should -Be 1
+            $cancelDeclarations[0].Groups['value'].Value.Trim() | Should -Be $workflow.CancelInProgress
+        }
 
-        $combinedWorkflow = $ciWorkflow + "`n" + $releaseWorkflow
-        $checkoutCount = [regex]::Matches($combinedWorkflow, 'uses:\s*actions/checkout@').Count
-        $credentialCount = [regex]::Matches($combinedWorkflow, 'persist-credentials:\s*false').Count
-        $credentialCount | Should -Be $checkoutCount
+        $ciTimeouts = [regex]::Matches(
+            $ciWorkflow,
+            '(?m)^[ \t]*timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $ciTimeouts.Count | Should -Be 1
+        $ciTimeouts[0].Groups['value'].Value.Trim() | Should -Be '20'
+        $releaseTimeouts = [regex]::Matches(
+            $releaseWorkflow,
+            '(?m)^[ \t]*timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $releaseTimeouts.Count | Should -Be 3
+        @($releaseTimeouts | ForEach-Object { $_.Groups['value'].Value.Trim() }) |
+            Should -Be @('20', '10', '10')
+        $jobsBlocks = [regex]::Matches(
+            $releaseWorkflow,
+            '(?m)^jobs:[^\r\n]*(?:\r?\n(?:[ \t]+[^\r\n]*|[ \t]*$))*'
+        )
+        $jobsBlocks.Count | Should -Be 1
+        $expectedJobTimeouts = @(
+            [pscustomobject]@{ Job = 'validate'; Value = '20' },
+            [pscustomobject]@{ Job = 'package'; Value = '10' },
+            [pscustomobject]@{ Job = 'publish'; Value = '10' }
+        )
+        foreach ($expectedTimeout in $expectedJobTimeouts) {
+            $jobPattern = '(?m)^  ' + [regex]::Escape($expectedTimeout.Job) +
+                ':[^\r\n]*(?:\r?\n(?: {4,}[^\r\n]*|[ \t]*$))*'
+            $jobBlock = [regex]::Match($jobsBlocks[0].Value, $jobPattern)
+            $jobBlock.Success | Should -BeTrue
+            $jobTimeouts = [regex]::Matches(
+                $jobBlock.Value,
+                '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            )
+            $jobTimeouts.Count | Should -Be 1
+            $jobTimeouts[0].Groups['value'].Value.Trim() | Should -Be $expectedTimeout.Value
+        }
+
+        foreach ($workflow in @($ciWorkflow, $releaseWorkflow)) {
+            $stepBlocks = [regex]::Matches(
+                $workflow,
+                '(?m)^ {6}-[^\r\n]*(?:\r?\n(?: {8,}[^\r\n]*|[ \t]*$))*'
+            )
+            $checkoutSteps = @($stepBlocks | Where-Object {
+                $_.Value -match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*actions/checkout@'
+            })
+            $checkoutSteps.Count | Should -BeGreaterThan 0
+            foreach ($checkoutStep in $checkoutSteps) {
+                $withBlocks = [regex]::Matches(
+                    $checkoutStep.Value,
+                    '(?m)^ {8}with:[^\r\n]*(?:\r?\n(?: {10,}[^\r\n]*|[ \t]*$))*'
+                )
+                $withBlocks.Count | Should -Be 1
+                $credentialDeclarations = [regex]::Matches(
+                    $withBlocks[0].Value,
+                    '(?m)^ {10}persist-credentials[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+                )
+                $credentialDeclarations.Count | Should -Be 1
+                $credentialDeclarations[0].Groups['value'].Value.Trim() | Should -Be 'false'
+            }
+        }
     }
 
     It 'isolates GitHub context from release PowerShell scripts and validates asset globs' {
         ([regex]::Matches($releaseWorkflow, 'RELEASE_TAG:\s*\$\{\{\s*github\.ref_name\s*\}\}')).Count | Should -Be 3
         $releaseWorkflow | Should -Match 'REPOSITORY:\s*\$\{\{\s*github\.repository\s*\}\}'
-        $releaseWorkflow | Should -Not -Match '\$tag\s*=\s*''\$\{\{\s*github\.ref_name'
-        $releaseWorkflow | Should -Not -Match 'gh\s+release\s+edit\s+''\$\{\{'
+        $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*\$tag[ \t]*=[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
+        $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*(?:&[ \t]+)?gh(?:\.exe)?[ \t]+release[ \t]+edit\b[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
         $releaseWorkflow | Should -Match 'fail_on_unmatched_files:\s*true'
     }
 
