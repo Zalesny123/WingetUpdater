@@ -1461,6 +1461,146 @@ Describe 'Release Package Manifest' {
         $releaseWorkflow | Should -Match 'GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}'
     }
 
+    It 'inspects release state before mutating immutable publication' {
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseStateSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {8}id:[ \t]*release-state[ \t]*$'
+        })
+        $releaseStateSteps.Count | Should -Be 1
+        $releaseStateSteps[0].Value | Should -Match '(?m)^ {6}-[ \t]*name:[ \t]*Inspect existing release[ \t]*$'
+        $releaseStateEnvBlocks = @(& $getYamlBlocks $releaseStateSteps[0].Value 8 'env')
+        $releaseStateEnvBlocks.Count | Should -Be 1
+        foreach ($expectedEnvironment in @(
+            [pscustomobject]@{ Name = 'GH_TOKEN'; Value = '${{ github.token }}' },
+            [pscustomobject]@{ Name = 'RELEASE_TAG'; Value = '${{ github.ref_name }}' },
+            [pscustomobject]@{ Name = 'REPOSITORY'; Value = '${{ github.repository }}' }
+        )) {
+            $declarations = [regex]::Matches(
+                $releaseStateEnvBlocks[0].Value,
+                ('(?m)^ {10}' + [regex]::Escape($expectedEnvironment.Name) +
+                    '[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$')
+            )
+            $declarations.Count | Should -Be 1
+            $declarations[0].Groups['value'].Value.Trim() | Should -Be $expectedEnvironment.Value
+        }
+
+        $releaseStateIndex = $releaseWorkflow.IndexOf($releaseStateSteps[0].Value)
+        foreach ($stepName in @(
+            'Attest release artifacts',
+            'Upload draft release assets',
+            'Publish immutable GitHub Release'
+        )) {
+            $gatedSteps = @($releaseSteps | Where-Object {
+                $_.Value -match ('(?m)^ {6}-[ \t]*name:[ \t]*' + [regex]::Escape($stepName) + '[ \t]*$')
+            })
+            $gatedSteps.Count | Should -Be 1
+            $releaseWorkflow.IndexOf($gatedSteps[0].Value) | Should -BeGreaterThan $releaseStateIndex
+            $ifDeclarations = [regex]::Matches(
+                $gatedSteps[0].Value,
+                '(?m)^ {8}if:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            )
+            $ifDeclarations.Count | Should -Be 1
+            $ifDeclarations[0].Groups['value'].Value.Trim() |
+                Should -Be "steps.release-state.outputs.state != 'published'"
+        }
+
+        $releaseActionSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*softprops/action-gh-release@'
+        })
+        $releaseActionSteps.Count | Should -Be 1
+        $releaseActionWithBlocks = @(& $getYamlBlocks $releaseActionSteps[0].Value 8 'with')
+        $releaseActionWithBlocks.Count | Should -Be 1
+        $releaseNoteSettings = [regex]::Matches(
+            $releaseActionWithBlocks[0].Value,
+            '(?m)^ {10}generate_release_notes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $releaseNoteSettings.Count | Should -Be 1
+        $releaseNoteSettings[0].Groups['value'].Value.Trim() |
+            Should -Be "`${{ steps.release-state.outputs.state == 'missing' }}"
+    }
+
+    It 'verifies an existing published release before treating publication as complete' {
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseStateSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {8}id:[ \t]*release-state[ \t]*$'
+        })
+        $releaseStateSteps.Count | Should -Be 1
+        $runBlocks = @(& $getYamlBlocks $releaseStateSteps[0].Value 8 'run')
+        $runBlocks.Count | Should -Be 1
+        $commandText = & $getRunCommandText $runBlocks[0]
+
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $commandText,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $commands = @($ast.FindAll({
+            param($node)
+
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true))
+        $commandLines = @($commands | ForEach-Object { $_.Extent.Text.Trim() })
+
+        $tagQueries = @($commandLines | Where-Object {
+            $_ -match '(?i)^gh(?:\.exe)?[ \t]+api\b' -and
+                $_ -match 'repos/\$env:REPOSITORY/releases/tags/\$env:RELEASE_TAG'
+        })
+        $tagQueries.Count | Should -Be 1
+        $draftQueries = @($commandLines | Where-Object {
+            $_ -match '(?i)^gh(?:\.exe)?[ \t]+api\b' -and
+                $_ -match '--paginate\b' -and
+                $_ -match 'repos/\$env:REPOSITORY/releases\?per_page=100'
+        })
+        $draftQueries.Count | Should -Be 1
+        $commandText | Should -Match '(?i)HTTP[ \t]+404'
+        $commandText | Should -Match '(?i)Not[ \t]+Found'
+        $commandText | Should -Match '(?i)throw\b'
+        $commandText | Should -Match '(?i)\$release\.draft\s*-eq\s*\$true'
+
+        $stateWrites = @($commandLines | Where-Object {
+            $_ -match '(?i)^Add-Content\b' -and $_ -match '\$env:GITHUB_OUTPUT\b'
+        })
+        $stateWrites.Count | Should -Be 3
+        $states = @(
+            foreach ($stateWrite in $stateWrites) {
+                $stateMatch = [regex]::Match($stateWrite, '(?i)state=(?<state>missing|draft|published)')
+                $stateMatch.Success | Should -BeTrue
+                $stateMatch.Groups['state'].Value.ToLowerInvariant()
+            }
+        )
+        @($states | Sort-Object) | Should -Be @('draft', 'missing', 'published')
+
+        $downloads = @($commandLines | Where-Object {
+            $_ -match '(?i)^gh(?:\.exe)?[ \t]+release[ \t]+download\b'
+        })
+        $downloads.Count | Should -Be 1
+        $downloads[0] | Should -Match '\$env:RELEASE_TAG\b'
+        $downloads[0] | Should -Match '--repo[ \t]+\$env:REPOSITORY\b'
+        $downloads[0] | Should -Match '--dir[ \t]+\$verificationDirectory\b'
+        $downloads[0] | Should -Match '--clobber\b'
+        ([regex]::Matches($downloads[0], '--pattern\b')).Count | Should -Be 2
+        $downloads[0] | Should -Match '--pattern[ \t]+(?:''|")?SHA256SUMS(?:''|")?\b'
+        $downloads[0] | Should -Match '--pattern[ \t]+\$expectedZip\b'
+
+        $commandText | Should -Match '\$env:RUNNER_TEMP\b'
+        $commandText | Should -Match '(?i)New-Item\b[^\r\n]*-ItemType[ \t]+Directory'
+        $commandText | Should -Match '(?i)Compare-Object\b[^\r\n]*-ReferenceObject[ \t]+\$expectedNames\b[^\r\n]*-DifferenceObject[ \t]+\$releaseAssetNames\b'
+        $commandText | Should -Match '(?i)Compare-Object\b[^\r\n]*-ReferenceObject[ \t]+\$expectedNames\b[^\r\n]*-DifferenceObject[ \t]+\$downloadedNames\b'
+        $commandText | Should -Match '\[0-9a-fA-F\]\{64\}'
+        $commandText | Should -Match '(?i)\$checksumMatch\.Groups\[[''"]filename[''"]\]\.Value\s*-cne\s*\$expectedZip'
+        $commandText | Should -Match '(?i)Get-FileHash\b[^\r\n]*-Algorithm[ \t]+SHA256'
+
+        $downloadIndex = $commandText.IndexOf($downloads[0])
+        $hashIndex = $commandText.IndexOf('Get-FileHash')
+        $publishedIndex = $commandText.IndexOf('state=published')
+        $downloadIndex | Should -BeGreaterOrEqual 0
+        $hashIndex | Should -BeGreaterThan $downloadIndex
+        $publishedIndex | Should -BeGreaterThan $hashIndex
+    }
+
     It 'keeps every GitHub Action pinned to a full commit SHA' {
         $actionReferences = [regex]::Matches($ciWorkflow + "`n" + $releaseWorkflow, 'uses:\s*[^\s]+@(?<ref>[^\s#]+)')
         $actionReferences.Count | Should -BeGreaterThan 0
@@ -1613,8 +1753,8 @@ Describe 'Release Package Manifest' {
                 ) | ForEach-Object { $_ }
             }
         )
-        $releaseTagDeclarations.Count | Should -Be 3
-        $repositoryDeclarations.Count | Should -Be 1
+        $releaseTagDeclarations.Count | Should -Be 4
+        $repositoryDeclarations.Count | Should -Be 2
         foreach ($declaration in $releaseTagDeclarations) {
             $declaration.Groups['value'].Value.Trim() | Should -Be '${{ github.ref_name }}'
         }

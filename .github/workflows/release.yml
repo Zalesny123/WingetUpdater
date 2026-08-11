@@ -218,7 +218,109 @@ jobs:
           $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $parts[0]) { throw 'Downloaded release bundle checksum mismatch.' }
 
+      - name: Inspect existing release
+        id: release-state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $expectedZip = "WingetUpdater-$env:RELEASE_TAG.zip"
+          $release = $null
+          $apiErrorPath = Join-Path $env:RUNNER_TEMP "release-api-$([guid]::NewGuid().ToString('N')).txt"
+          $releaseJson = gh api "repos/$env:REPOSITORY/releases/tags/$env:RELEASE_TAG" 2> $apiErrorPath
+          $apiExitCode = $LASTEXITCODE
+
+          if ($apiExitCode -eq 0) {
+              $release = ConvertFrom-Json -InputObject ($releaseJson -join "`n") -ErrorAction Stop
+          }
+          else {
+              $apiError = if (Test-Path -LiteralPath $apiErrorPath) {
+                  [System.IO.File]::ReadAllText($apiErrorPath)
+              }
+              else {
+                  ''
+              }
+              if ($apiError -notmatch '(?i)Not Found' -or $apiError -notmatch '(?i)HTTP 404') {
+                  throw "Unable to inspect release '$env:RELEASE_TAG': $apiError"
+              }
+
+              # The tag endpoint exposes only published releases, so scan authenticated listings for drafts.
+              $listErrorPath = Join-Path $env:RUNNER_TEMP "release-list-$([guid]::NewGuid().ToString('N')).txt"
+              $releasePagesJson = gh api --paginate --slurp "repos/$env:REPOSITORY/releases?per_page=100" 2> $listErrorPath
+              if ($LASTEXITCODE -ne 0) {
+                  $listError = if (Test-Path -LiteralPath $listErrorPath) {
+                      [System.IO.File]::ReadAllText($listErrorPath)
+                  }
+                  else {
+                      ''
+                  }
+                  throw "Unable to inspect draft releases: $listError"
+              }
+
+              $releasePages = ConvertFrom-Json -InputObject ($releasePagesJson -join "`n") -ErrorAction Stop
+              $matchingReleases = @(
+                  foreach ($page in @($releasePages)) {
+                      foreach ($candidate in @($page)) {
+                          if ($candidate.tag_name -ceq $env:RELEASE_TAG) {
+                              $candidate
+                          }
+                      }
+                  }
+              )
+              $release = $matchingReleases |
+                  Sort-Object @{ Expression = { [int]$_.draft } }, id |
+                  Select-Object -First 1
+          }
+
+          if ($null -eq $release) {
+              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=missing'
+              return
+          }
+          if ($release.draft -eq $true) {
+              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=draft'
+              return
+          }
+
+          $expectedNames = @('SHA256SUMS', $expectedZip) | Sort-Object
+          $releaseAssetNames = @($release.assets | ForEach-Object name | Sort-Object)
+          if (@(Compare-Object -ReferenceObject $expectedNames -DifferenceObject $releaseAssetNames).Count -ne 0) {
+              throw "Published release has unexpected assets: $($releaseAssetNames -join ', ')"
+          }
+
+          $verificationDirectory = Join-Path $env:RUNNER_TEMP "published-release-$([guid]::NewGuid().ToString('N'))"
+          [void](New-Item -ItemType Directory -Path $verificationDirectory)
+          gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --dir $verificationDirectory --clobber --pattern 'SHA256SUMS' --pattern $expectedZip
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to download published release assets for verification.'
+          }
+
+          $downloadedNames = @(Get-ChildItem -LiteralPath $verificationDirectory -File | ForEach-Object Name | Sort-Object)
+          if (@(Compare-Object -ReferenceObject $expectedNames -DifferenceObject $downloadedNames).Count -ne 0) {
+              throw "Downloaded release has unexpected assets: $($downloadedNames -join ', ')"
+          }
+
+          $checksumPath = Join-Path $verificationDirectory 'SHA256SUMS'
+          $checksumText = [System.IO.File]::ReadAllText($checksumPath)
+          $checksumMatch = [regex]::Match($checksumText, '\A(?<hash>[0-9a-fA-F]{64})  (?<filename>[^\r\n]+)\r?\n?\z')
+          if (-not $checksumMatch.Success) {
+              throw 'Published SHA256SUMS has an invalid format.'
+          }
+          if ($checksumMatch.Groups['filename'].Value -cne $expectedZip) {
+              throw 'Published SHA256SUMS names an unexpected archive.'
+          }
+
+          $publishedZipPath = Join-Path $verificationDirectory $expectedZip
+          $actualHash = (Get-FileHash -LiteralPath $publishedZipPath -Algorithm SHA256).Hash
+          if ($actualHash -cne $checksumMatch.Groups['hash'].Value) {
+              throw 'Published release archive checksum mismatch.'
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=published'
+
       - name: Attest release artifacts
+        if: steps.release-state.outputs.state != 'published'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
@@ -226,6 +328,7 @@ jobs:
             release/SHA256SUMS
 
       - name: Upload draft release assets
+        if: steps.release-state.outputs.state != 'published'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
@@ -233,10 +336,11 @@ jobs:
             release/SHA256SUMS
           draft: true
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: ${{ steps.release-state.outputs.state == 'missing' }}
           fail_on_unmatched_files: true
 
       - name: Publish immutable GitHub Release
+        if: steps.release-state.outputs.state != 'published'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
