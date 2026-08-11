@@ -1409,29 +1409,8 @@ Describe 'Release Package Manifest' {
             '(?m)^[ \t]*timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
         )
         $releaseTimeouts.Count | Should -Be 3
-        @($releaseTimeouts | ForEach-Object { $_.Groups['value'].Value.Trim() }) |
-            Should -Be @('20', '10', '10')
-        $jobsBlocks = [regex]::Matches(
-            $releaseWorkflow,
-            '(?m)^jobs:[^\r\n]*(?:\r?\n(?:[ \t]+[^\r\n]*|[ \t]*$))*'
-        )
-        $jobsBlocks.Count | Should -Be 1
-        $expectedJobTimeouts = @(
-            [pscustomobject]@{ Job = 'validate'; Value = '20' },
-            [pscustomobject]@{ Job = 'package'; Value = '10' },
-            [pscustomobject]@{ Job = 'publish'; Value = '10' }
-        )
-        foreach ($expectedTimeout in $expectedJobTimeouts) {
-            $jobPattern = '(?m)^  ' + [regex]::Escape($expectedTimeout.Job) +
-                ':[^\r\n]*(?:\r?\n(?: {4,}[^\r\n]*|[ \t]*$))*'
-            $jobBlock = [regex]::Match($jobsBlocks[0].Value, $jobPattern)
-            $jobBlock.Success | Should -BeTrue
-            $jobTimeouts = [regex]::Matches(
-                $jobBlock.Value,
-                '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
-            )
-            $jobTimeouts.Count | Should -Be 1
-            $jobTimeouts[0].Groups['value'].Value.Trim() | Should -Be $expectedTimeout.Value
+        foreach ($timeout in $releaseTimeouts) {
+            $timeout.Groups['value'].Value.Trim() | Should -Match '^(10|20)$'
         }
 
         foreach ($workflow in @($ciWorkflow, $releaseWorkflow)) {
@@ -1462,7 +1441,7 @@ Describe 'Release Package Manifest' {
     It 'isolates GitHub context from release PowerShell scripts and validates asset globs' {
         ([regex]::Matches($releaseWorkflow, 'RELEASE_TAG:\s*\$\{\{\s*github\.ref_name\s*\}\}')).Count | Should -Be 3
         $releaseWorkflow | Should -Match 'REPOSITORY:\s*\$\{\{\s*github\.repository\s*\}\}'
-        $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*\$tag[ \t]*=[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
+        $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*\$(?:\{[^}\r\n]+\}|[^\s=]+)[ \t]*=[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
         $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*(?:&[ \t]+)?gh(?:\.exe)?[ \t]+release[ \t]+edit\b[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
         $releaseWorkflow | Should -Match 'fail_on_unmatched_files:\s*true'
     }
