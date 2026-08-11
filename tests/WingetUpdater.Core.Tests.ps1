@@ -1495,6 +1495,22 @@ Describe 'Release Package Manifest' {
             })
             $gatedSteps.Count | Should -Be 1
             $releaseWorkflow.IndexOf($gatedSteps[0].Value) | Should -BeGreaterThan $releaseStateIndex
+        }
+
+        $attestationSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {6}-[ \t]*name:[ \t]*Attest release artifacts[ \t]*$'
+        })
+        $attestationSteps.Count | Should -Be 1
+        @([regex]::Matches($attestationSteps[0].Value, '(?m)^ {8}if:[ \t]*')).Count | Should -Be 0
+
+        foreach ($stepName in @(
+            'Upload draft release assets',
+            'Publish immutable GitHub Release'
+        )) {
+            $gatedSteps = @($releaseSteps | Where-Object {
+                $_.Value -match ('(?m)^ {6}-[ \t]*name:[ \t]*' + [regex]::Escape($stepName) + '[ \t]*$')
+            })
+            $gatedSteps.Count | Should -Be 1
             $ifDeclarations = [regex]::Matches(
                 $gatedSteps[0].Value,
                 '(?m)^ {8}if:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
@@ -1517,6 +1533,47 @@ Describe 'Release Package Manifest' {
         $releaseNoteSettings.Count | Should -Be 1
         $releaseNoteSettings[0].Groups['value'].Value.Trim() |
             Should -Be "`${{ steps.release-state.outputs.state == 'missing' }}"
+    }
+
+    It 'rejects unexpected existing draft assets before allowing recovery' {
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseStateSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {8}id:[ \t]*release-state[ \t]*$'
+        })
+        $releaseStateSteps.Count | Should -Be 1
+        $runBlocks = @(& $getYamlBlocks $releaseStateSteps[0].Value 8 'run')
+        $runBlocks.Count | Should -Be 1
+        $commandText = & $getRunCommandText $runBlocks[0]
+
+        $expectedNamesAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$expectedNames\s*=\s*@\((?<names>[^\r\n]+)\)[ \t]*\|[ \t]*Sort-Object[ \t]*$'
+        )
+        $expectedNamesAssignment.Success | Should -BeTrue
+        @($expectedNamesAssignment.Groups['names'].Value -split ',' | ForEach-Object { $_.Trim() }) |
+            Should -Be @("'SHA256SUMS'", '$expectedZip')
+
+        $draftAssetAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$draftAssetNames\s*=\s*@\(\$release\.assets[ \t]*\|[ \t]*ForEach-Object[ \t]+name[ \t]*\|[ \t]*Sort-Object\)[ \t]*$'
+        )
+        $draftAssetAssignment.Success | Should -BeTrue
+        $unexpectedAssetAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$unexpectedDraftAssets\s*=\s*@\(\$draftAssetNames[ \t]*\|[ \t]*Where-Object[ \t]*\{[ \t]*\$_[ \t]+-cnotin[ \t]+\$expectedNames[ \t]*\}\)[ \t]*$'
+        )
+        $unexpectedAssetAssignment.Success | Should -BeTrue
+        $unexpectedAssetGuards = [regex]::Matches(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$unexpectedDraftAssets\.Count[ \t]+-gt[ \t]+0[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+throw\b[^\r\n]*\r?\n[ \t]*\}'
+        )
+        $unexpectedAssetGuards.Count | Should -Be 1
+
+        $draftOutputIndex = $commandText.IndexOf('state=draft')
+        $expectedNamesAssignment.Index | Should -BeLessThan $draftAssetAssignment.Index
+        $draftAssetAssignment.Index | Should -BeLessThan $unexpectedAssetAssignment.Index
+        $unexpectedAssetAssignment.Index | Should -BeLessThan $unexpectedAssetGuards[0].Index
+        $unexpectedAssetGuards[0].Index | Should -BeLessThan $draftOutputIndex
     }
 
     It 'verifies an existing published release before treating publication as complete' {
@@ -1718,6 +1775,17 @@ Describe 'Release Package Manifest' {
             $cancelDeclarations.Count | Should -Be 1
             $cancelDeclarations[0].Groups['value'].Value.Trim() | Should -Be $workflow.CancelInProgress
         }
+
+        $releaseConcurrencyBlocks = [regex]::Matches(
+            $releaseWorkflow,
+            '(?m)^concurrency:[^\r\n]*(?:\r?\n(?:[ \t]+[^\r\n]*|[ \t]*$))*'
+        )
+        $releaseGroups = [regex]::Matches(
+            $releaseConcurrencyBlocks[0].Value,
+            '(?m)^  group[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $releaseGroups.Count | Should -Be 1
+        $releaseGroups[0].Groups['value'].Value.Trim() | Should -Be 'release-publication'
 
         $ciJobsBlocks = @(& $getYamlBlocks $ciWorkflow 0 'jobs')
         $ciJobsBlocks.Count | Should -Be 1
