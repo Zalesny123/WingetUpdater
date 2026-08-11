@@ -8,10 +8,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   validate:
     name: Validate (${{ matrix.shell }})
     runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -22,9 +27,10 @@ jobs:
 
     steps:
       - name: Checkout tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pinned PowerShell modules
         run: |
@@ -54,19 +60,23 @@ jobs:
     name: Validate tag and package release
     needs: validate
     runs-on: windows-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
     steps:
       - name: Checkout tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify annotated tag and version consistency
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           if ($tag -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
               throw "Release tag is not strict Semantic Versioning: $tag"
           }
@@ -101,8 +111,10 @@ jobs:
 
       - name: Build and verify release archive
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           $zipName = "WingetUpdater-$tag.zip"
 
           $files = @(
@@ -169,7 +181,7 @@ jobs:
           [System.IO.File]::WriteAllText('SHA256SUMS', "$hash  $zipName`n", (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Upload validated release bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-bundle
           path: |
@@ -182,14 +194,16 @@ jobs:
     name: Attest and publish release
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
 
     steps:
       - name: Download validated release bundle
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-bundle
           path: release
@@ -205,14 +219,14 @@ jobs:
           if ($actual -ne $parts[0]) { throw 'Downloaded release bundle checksum mismatch.' }
 
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/WingetUpdater-*.zip
             release/SHA256SUMS
 
       - name: Upload draft release assets
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             release/WingetUpdater-*.zip
@@ -220,10 +234,13 @@ jobs:
           draft: true
           prerelease: false
           generate_release_notes: true
+          fail_on_unmatched_files: true
 
       - name: Publish immutable GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          gh release edit '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft=false --latest
+          gh release edit $env:RELEASE_TAG --repo $env:REPOSITORY --draft=false --latest
