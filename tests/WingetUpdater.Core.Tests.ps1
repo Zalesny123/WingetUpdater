@@ -1622,6 +1622,38 @@ Describe 'Release Package Manifest' {
         $commandText.IndexOf('state=published') | Should -BeGreaterThan $hashComparisons[0].Index
     }
 
+    It 'matches both published assets to the current validated release bundle' {
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseStateSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {8}id:[ \t]*release-state[ \t]*$'
+        })
+        $releaseStateSteps.Count | Should -Be 1
+        $runBlocks = @(& $getYamlBlocks $releaseStateSteps[0].Value 8 'run')
+        $runBlocks.Count | Should -Be 1
+        $commandText = & $getRunCommandText $runBlocks[0]
+
+        $commandText | Should -Match '(?m)^[ \t]*\$currentZipPath\s*=\s*Join-Path[ \t]+release[ \t]+\$expectedZip[ \t]*$'
+        $commandText | Should -Match '(?m)^[ \t]*\$currentZipHash\s*=\s*\(Get-FileHash[ \t]+-LiteralPath[ \t]+\$currentZipPath[ \t]+-Algorithm[ \t]+SHA256\)\.Hash\.ToLowerInvariant\(\)[ \t]*$'
+        $zipComparisons = [regex]::Matches(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$actualHash[ \t]+-ne[ \t]+\$currentZipHash[ \t]*\)[ \t]*\{'
+        )
+        $zipComparisons.Count | Should -Be 1
+
+        $commandText | Should -Match '(?m)^[ \t]*\$currentChecksumPath\s*=\s*Join-Path[ \t]+release[ \t]+(?:''|")SHA256SUMS(?:''|")[ \t]*$'
+        $commandText | Should -Match '(?m)^[ \t]*\$currentChecksumHash\s*=\s*\(Get-FileHash[ \t]+-LiteralPath[ \t]+\$currentChecksumPath[ \t]+-Algorithm[ \t]+SHA256\)\.Hash\.ToLowerInvariant\(\)[ \t]*$'
+        $commandText | Should -Match '(?m)^[ \t]*\$publishedChecksumHash\s*=\s*\(Get-FileHash[ \t]+-LiteralPath[ \t]+\$checksumPath[ \t]+-Algorithm[ \t]+SHA256\)\.Hash\.ToLowerInvariant\(\)[ \t]*$'
+        $checksumComparisons = [regex]::Matches(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$publishedChecksumHash[ \t]+-ne[ \t]+\$currentChecksumHash[ \t]*\)[ \t]*\{'
+        )
+        $checksumComparisons.Count | Should -Be 1
+
+        $publishedIndex = $commandText.IndexOf('state=published')
+        $publishedIndex | Should -BeGreaterThan $zipComparisons[0].Index
+        $publishedIndex | Should -BeGreaterThan $checksumComparisons[0].Index
+    }
+
     It 'keeps every GitHub Action pinned to a full commit SHA' {
         $actionReferences = [regex]::Matches($ciWorkflow + "`n" + $releaseWorkflow, 'uses:\s*[^\s]+@(?<ref>[^\s#]+)')
         $actionReferences.Count | Should -BeGreaterThan 0

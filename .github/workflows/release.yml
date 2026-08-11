@@ -318,6 +318,19 @@ jobs:
               throw 'Published release archive checksum mismatch.'
           }
 
+          $currentZipPath = Join-Path release $expectedZip
+          $currentZipHash = (Get-FileHash -LiteralPath $currentZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $currentZipHash) {
+              throw 'Published release archive does not match the current validated bundle.'
+          }
+
+          $currentChecksumPath = Join-Path release 'SHA256SUMS'
+          $currentChecksumHash = (Get-FileHash -LiteralPath $currentChecksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $publishedChecksumHash = (Get-FileHash -LiteralPath $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($publishedChecksumHash -ne $currentChecksumHash) {
+              throw 'Published SHA256SUMS does not match the current validated bundle.'
+          }
+
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=published'
 
       - name: Attest release artifacts
