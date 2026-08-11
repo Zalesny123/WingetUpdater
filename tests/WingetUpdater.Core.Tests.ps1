@@ -1274,6 +1274,29 @@ Describe 'Release Package Manifest' {
             'CHANGELOG.md',
             'LICENSE'
         )
+        $getYamlBlocks = {
+            param(
+                [string]$Text,
+                [int]$Indent,
+                [string]$Key
+            )
+
+            $pattern = '(?m)^' + (' ' * $Indent) + [regex]::Escape($Key) +
+                ':[^\r\n]*(?:\r?\n(?:' + (' ' * ($Indent + 2)) + '[^\r\n]*|[ \t]*$))*'
+            [regex]::Matches($Text, $pattern) | ForEach-Object { $_ }
+        }
+        $getWorkflowSteps = {
+            param([string]$Text)
+
+            foreach ($jobsBlock in @(& $getYamlBlocks $Text 0 'jobs')) {
+                foreach ($stepsBlock in @(& $getYamlBlocks $jobsBlock.Value 4 'steps')) {
+                    [regex]::Matches(
+                        $stepsBlock.Value,
+                        '(?m)^ {6}-[^\r\n]*(?:\r?\n(?: {8,}[^\r\n]*|[ \t]*$))*'
+                    ) | ForEach-Object { $_ }
+                }
+            }
+        }
     }
 
     It 'builds a release ZIP containing exactly the required root entries' {
@@ -1331,11 +1354,36 @@ Describe 'Release Package Manifest' {
         $releaseWorkflow | Should -Match 'shell:\s*\[pwsh, powershell\]'
         $releaseWorkflow | Should -Match 'Invoke-ScriptAnalyzer'
         $releaseWorkflow | Should -Match 'Invoke-Pester'
-        $releaseWorkflow | Should -Match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*actions/attest@[0-9a-f]{40}(?:[ \t]+#.*)?[ \t]*$'
-        $releaseWorkflow | Should -Not -Match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*actions/attest-build-provenance@'
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseActionReferences = @(
+            foreach ($step in $releaseSteps) {
+                [regex]::Matches(
+                    $step.Value,
+                    '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*(?<reference>[^\s#]+)(?:[ \t]+#.*)?[ \t]*$'
+                ) | ForEach-Object { $_ }
+            }
+        )
+        @($releaseActionReferences | Where-Object {
+            $_.Groups['reference'].Value -match '^actions/attest@[0-9a-f]{40}$'
+        }).Count | Should -Be 1
+        @($releaseActionReferences | Where-Object {
+            $_.Groups['reference'].Value -match '^actions/attest-build-provenance@'
+        }).Count | Should -Be 0
         $releaseWorkflow | Should -Match 'attestations:\s*write'
-        $releaseWorkflow | Should -Match 'artifact-metadata:\s*write'
         $releaseWorkflow | Should -Match 'id-token:\s*write'
+
+        $jobsBlocks = @(& $getYamlBlocks $releaseWorkflow 0 'jobs')
+        $jobsBlocks.Count | Should -Be 1
+        $publishJobs = @(& $getYamlBlocks $jobsBlocks[0].Value 2 'publish')
+        $publishJobs.Count | Should -Be 1
+        $publishPermissions = @(& $getYamlBlocks $publishJobs[0].Value 4 'permissions')
+        $publishPermissions.Count | Should -Be 1
+        $artifactMetadata = [regex]::Matches(
+            $publishPermissions[0].Value,
+            '(?m)^ {6}artifact-metadata[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $artifactMetadata.Count | Should -Be 1
+        $artifactMetadata[0].Groups['value'].Value.Trim() | Should -Be 'write'
     }
 
     It 'builds the ZIP with deterministic entry order and tag-derived timestamps' {
@@ -1366,16 +1414,39 @@ Describe 'Release Package Manifest' {
 
     It 'pins the current Node.js 24 release actions to verified commits' {
         $expectedActions = @(
-            'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a',
-            'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
-            'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6',
-            'softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228'
+            [pscustomobject]@{
+                Name = 'actions/upload-artifact'
+                Reference = 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+            },
+            [pscustomobject]@{
+                Name = 'actions/download-artifact'
+                Reference = 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c'
+            },
+            [pscustomobject]@{
+                Name = 'actions/attest'
+                Reference = 'actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6'
+            },
+            [pscustomobject]@{
+                Name = 'softprops/action-gh-release'
+                Reference = 'softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228'
+            }
+        )
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseActionReferences = @(
+            foreach ($step in $releaseSteps) {
+                [regex]::Matches(
+                    $step.Value,
+                    '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*(?<reference>[^\s#]+)(?:[ \t]+#.*)?[ \t]*$'
+                ) | ForEach-Object { $_ }
+            }
         )
 
         foreach ($action in $expectedActions) {
-            $usesPattern = '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*' +
-                [regex]::Escape($action) + '(?:[ \t]+#.*)?[ \t]*$'
-            $releaseWorkflow | Should -Match $usesPattern
+            $occurrences = @($releaseActionReferences | Where-Object {
+                $_.Groups['reference'].Value -match ('^' + [regex]::Escape($action.Name) + '@')
+            })
+            $occurrences.Count | Should -Be 1
+            $occurrences[0].Groups['reference'].Value | Should -Be $action.Reference
         }
     }
 
@@ -1398,52 +1469,162 @@ Describe 'Release Package Manifest' {
             $cancelDeclarations[0].Groups['value'].Value.Trim() | Should -Be $workflow.CancelInProgress
         }
 
+        $ciJobsBlocks = @(& $getYamlBlocks $ciWorkflow 0 'jobs')
+        $ciJobsBlocks.Count | Should -Be 1
+        $ciTestJobs = @(& $getYamlBlocks $ciJobsBlocks[0].Value 2 'test')
+        $ciTestJobs.Count | Should -Be 1
         $ciTimeouts = [regex]::Matches(
-            $ciWorkflow,
-            '(?m)^[ \t]*timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            $ciTestJobs[0].Value,
+            '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
         )
         $ciTimeouts.Count | Should -Be 1
         $ciTimeouts[0].Groups['value'].Value.Trim() | Should -Be '20'
-        $releaseTimeouts = [regex]::Matches(
-            $releaseWorkflow,
-            '(?m)^[ \t]*timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
-        )
-        $releaseTimeouts.Count | Should -Be 3
-        foreach ($timeout in $releaseTimeouts) {
-            $timeout.Groups['value'].Value.Trim() | Should -Match '^(10|20)$'
+
+        $releaseJobsBlocks = @(& $getYamlBlocks $releaseWorkflow 0 'jobs')
+        $releaseJobsBlocks.Count | Should -Be 1
+        foreach ($jobName in @('validate', 'package', 'publish')) {
+            $releaseJobs = @(& $getYamlBlocks $releaseJobsBlocks[0].Value 2 $jobName)
+            $releaseJobs.Count | Should -Be 1
+            $jobTimeouts = [regex]::Matches(
+                $releaseJobs[0].Value,
+                '(?m)^ {4}timeout-minutes[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            )
+            $jobTimeouts.Count | Should -Be 1
+            $jobTimeouts[0].Groups['value'].Value.Trim() | Should -Match '^(10|20)$'
         }
 
         foreach ($workflow in @($ciWorkflow, $releaseWorkflow)) {
-            $stepBlocks = [regex]::Matches(
-                $workflow,
-                '(?m)^ {6}-[^\r\n]*(?:\r?\n(?: {8,}[^\r\n]*|[ \t]*$))*'
-            )
+            $stepBlocks = @(& $getWorkflowSteps $workflow)
             $checkoutSteps = @($stepBlocks | Where-Object {
                 $_.Value -match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*actions/checkout@'
             })
             $checkoutSteps.Count | Should -BeGreaterThan 0
             foreach ($checkoutStep in $checkoutSteps) {
-                $withBlocks = [regex]::Matches(
-                    $checkoutStep.Value,
-                    '(?m)^ {8}with:[^\r\n]*(?:\r?\n(?: {10,}[^\r\n]*|[ \t]*$))*'
-                )
+                $withBlocks = @(& $getYamlBlocks $checkoutStep.Value 8 'with')
                 $withBlocks.Count | Should -Be 1
                 $credentialDeclarations = [regex]::Matches(
                     $withBlocks[0].Value,
                     '(?m)^ {10}persist-credentials[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
                 )
                 $credentialDeclarations.Count | Should -Be 1
-                $credentialDeclarations[0].Groups['value'].Value.Trim() | Should -Be 'false'
+                $credentialDeclarations[0].Groups['value'].Value.Trim() |
+                    Should -Match '^(?i:false|''false''|"false")$'
             }
         }
     }
 
     It 'isolates GitHub context from release PowerShell scripts and validates asset globs' {
-        ([regex]::Matches($releaseWorkflow, 'RELEASE_TAG:\s*\$\{\{\s*github\.ref_name\s*\}\}')).Count | Should -Be 3
-        $releaseWorkflow | Should -Match 'REPOSITORY:\s*\$\{\{\s*github\.repository\s*\}\}'
-        $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*\$(?:\{[^}\r\n]+\}|[^\s=]+)[ \t]*=[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
-        $releaseWorkflow | Should -Not -Match '(?mi)^[ \t]*(?:&[ \t]+)?gh(?:\.exe)?[ \t]+release[ \t]+edit\b[^\r\n]*\$\{\{[ \t]*github\.ref_name[ \t]*\}\}'
-        $releaseWorkflow | Should -Match 'fail_on_unmatched_files:\s*true'
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $releaseSteps.Count | Should -BeGreaterThan 0
+        $releaseRunBlocks = @(
+            foreach ($step in $releaseSteps) {
+                @(& $getYamlBlocks $step.Value 8 'run') | Where-Object {
+                    $_.Value -match '(?m)^ {8}run:[ \t]*\|[ \t]*(?:#.*)?$'
+                }
+            }
+        )
+        $releaseRunBlocks.Count | Should -BeGreaterThan 0
+        foreach ($runBlock in $releaseRunBlocks) {
+            $runBlock.Value | Should -Not -Match '\$\{\{[ \t]*github\.(?:ref_name|repository)[ \t]*\}\}'
+        }
+
+        $releaseEnvBlocks = @(
+            foreach ($step in $releaseSteps) {
+                @(& $getYamlBlocks $step.Value 8 'env')
+            }
+        )
+        $releaseTagDeclarations = @(
+            foreach ($envBlock in $releaseEnvBlocks) {
+                [regex]::Matches(
+                    $envBlock.Value,
+                    '(?m)^ {10}RELEASE_TAG[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+                ) | ForEach-Object { $_ }
+            }
+        )
+        $repositoryDeclarations = @(
+            foreach ($envBlock in $releaseEnvBlocks) {
+                [regex]::Matches(
+                    $envBlock.Value,
+                    '(?m)^ {10}REPOSITORY[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+                ) | ForEach-Object { $_ }
+            }
+        )
+        $releaseTagDeclarations.Count | Should -Be 3
+        $repositoryDeclarations.Count | Should -Be 1
+        foreach ($declaration in $releaseTagDeclarations) {
+            $declaration.Groups['value'].Value.Trim() | Should -Be '${{ github.ref_name }}'
+        }
+        $repositoryDeclarations[0].Groups['value'].Value.Trim() |
+            Should -Be '${{ github.repository }}'
+
+        foreach ($stepName in @(
+            'Verify annotated tag and version consistency',
+            'Build and verify release archive'
+        )) {
+            $tagSteps = @($releaseSteps | Where-Object {
+                $_.Value -match ('(?m)^ {6}-[ \t]*name:[ \t]*' + [regex]::Escape($stepName) + '[ \t]*$')
+            })
+            $tagSteps.Count | Should -Be 1
+            $tagRunBlocks = @(& $getYamlBlocks $tagSteps[0].Value 8 'run' | Where-Object {
+                $_.Value -match '(?m)^ {8}run:[ \t]*\|[ \t]*(?:#.*)?$'
+            })
+            $tagRunBlocks.Count | Should -Be 1
+            $tagRunBlocks[0].Value | Should -Match '\$env:RELEASE_TAG\b'
+            $tagEnvBlocks = @(& $getYamlBlocks $tagSteps[0].Value 8 'env')
+            $tagEnvBlocks.Count | Should -Be 1
+            $tagEnvDeclarations = [regex]::Matches(
+                $tagEnvBlocks[0].Value,
+                '(?m)^ {10}RELEASE_TAG[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+            )
+            $tagEnvDeclarations.Count | Should -Be 1
+            $tagEnvDeclarations[0].Groups['value'].Value.Trim() |
+                Should -Be '${{ github.ref_name }}'
+        }
+
+        $publishSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {6}-[ \t]*name:[ \t]*Publish immutable GitHub Release[ \t]*$'
+        })
+        $publishSteps.Count | Should -Be 1
+        $publishRunBlocks = @(& $getYamlBlocks $publishSteps[0].Value 8 'run' | Where-Object {
+            $_.Value -match '(?m)^ {8}run:[ \t]*\|[ \t]*(?:#.*)?$'
+        })
+        $publishRunBlocks.Count | Should -Be 1
+        $publishEnvBlocks = @(& $getYamlBlocks $publishSteps[0].Value 8 'env')
+        $publishEnvBlocks.Count | Should -Be 1
+        $publishTagDeclarations = [regex]::Matches(
+            $publishEnvBlocks[0].Value,
+            '(?m)^ {10}RELEASE_TAG[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $publishTagDeclarations.Count | Should -Be 1
+        $publishTagDeclarations[0].Groups['value'].Value.Trim() |
+            Should -Be '${{ github.ref_name }}'
+        $publishRepositoryDeclarations = [regex]::Matches(
+            $publishEnvBlocks[0].Value,
+            '(?m)^ {10}REPOSITORY[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $publishRepositoryDeclarations.Count | Should -Be 1
+        $publishRepositoryDeclarations[0].Groups['value'].Value.Trim() |
+            Should -Be '${{ github.repository }}'
+        $publishCommand = [regex]::Match(
+            $publishRunBlocks[0].Value,
+            '(?mi)^[ \t]*(?:&[ \t]+)?gh(?:\.exe)?[ \t]+release[ \t]+edit\b[^\r\n]*$'
+        )
+        $publishCommand.Success | Should -BeTrue
+        $publishCommand.Value | Should -Match '\$env:RELEASE_TAG\b'
+        $publishCommand.Value | Should -Match '\$env:REPOSITORY\b'
+
+        $releaseActionSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^(?: {6}-[ \t]*| {8})uses:[ \t]*softprops/action-gh-release@'
+        })
+        $releaseActionSteps.Count | Should -Be 1
+        $releaseActionWithBlocks = @(& $getYamlBlocks $releaseActionSteps[0].Value 8 'with')
+        $releaseActionWithBlocks.Count | Should -Be 1
+        $unmatchedFileSettings = [regex]::Matches(
+            $releaseActionWithBlocks[0].Value,
+            '(?m)^ {10}fail_on_unmatched_files[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $unmatchedFileSettings.Count | Should -Be 1
+        $unmatchedFileSettings[0].Groups['value'].Value.Trim() | Should -Be 'true'
     }
 
     It 'pins the native Node.js 24 checkout action to the verified v7 commit' {
