@@ -10,6 +10,7 @@ permissions:
 
 concurrency:
   group: release-publication
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -185,7 +186,7 @@ jobs:
         with:
           name: release-bundle
           path: |
-            WingetUpdater-*.zip
+            WingetUpdater-${{ github.ref_name }}.zip
             SHA256SUMS
           if-no-files-found: error
           retention-days: 7
@@ -363,7 +364,7 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
-            release/WingetUpdater-*.zip
+            release/WingetUpdater-${{ github.ref_name }}.zip
             release/SHA256SUMS
 
       - name: Upload draft release assets
@@ -371,7 +372,7 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
-            release/WingetUpdater-*.zip
+            release/WingetUpdater-${{ github.ref_name }}.zip
             release/SHA256SUMS
           draft: true
           prerelease: false
@@ -386,4 +387,48 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          gh release edit $env:RELEASE_TAG --repo $env:REPOSITORY --draft=false --latest
+          if ($env:RELEASE_TAG -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+              throw "Release tag is not strict Semantic Versioning: $env:RELEASE_TAG"
+          }
+          $currentVersion = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+
+          $releaseListErrorPath = Join-Path $env:RUNNER_TEMP "published-releases-$([guid]::NewGuid().ToString('N')).txt"
+          $releasePagesJson = gh api --paginate --slurp "repos/$env:REPOSITORY/releases?per_page=100" 2> $releaseListErrorPath
+          $releaseListExitCode = $LASTEXITCODE
+          if ($releaseListExitCode -ne 0) {
+              $releaseListError = if (Test-Path -LiteralPath $releaseListErrorPath) {
+                  [System.IO.File]::ReadAllText($releaseListErrorPath)
+              }
+              else {
+                  ''
+              }
+              throw "Unable to inspect published releases: $releaseListError"
+          }
+
+          $releasePages = ConvertFrom-Json -InputObject ($releasePagesJson -join "`n") -ErrorAction Stop
+          $allReleases = @(
+              foreach ($page in @($releasePages)) {
+                  foreach ($candidate in @($page)) {
+                      $candidate
+                  }
+              }
+          )
+
+          $hasHigherStableRelease = $false
+          foreach ($candidate in $allReleases) {
+              if ($candidate.draft -eq $true -or $candidate.prerelease -eq $true) { continue }
+              $candidateTag = [string]$candidate.tag_name
+              if ($candidateTag -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') { continue }
+              $candidateVersion = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+              if ($candidateVersion -gt $currentVersion) {
+                  $hasHigherStableRelease = $true
+                  break
+              }
+          }
+
+          $latestValue = if ($hasHigherStableRelease) { 'false' } else { 'true' }
+          gh release edit $env:RELEASE_TAG --repo $env:REPOSITORY --draft=false "--latest=$latestValue"
+          $editExitCode = $LASTEXITCODE
+          if ($editExitCode -ne 0) {
+              throw "Unable to publish release '$env:RELEASE_TAG'."
+          }

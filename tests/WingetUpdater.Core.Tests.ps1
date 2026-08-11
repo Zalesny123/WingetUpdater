@@ -1451,14 +1451,160 @@ Describe 'Release Package Manifest' {
         $releaseWorkflow | Should -Match '\$files\s*\|\s*Sort-Object'
     }
 
+    It 'uses exact tag-derived ZIP paths for every release action input' {
+        $releaseWorkflow | Should -Not -Match 'WingetUpdater-\*\.zip'
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        foreach ($expectation in @(
+            [pscustomobject]@{
+                Name = 'Upload validated release bundle'
+                Key = 'path'
+                Items = @('WingetUpdater-${{ github.ref_name }}.zip', 'SHA256SUMS')
+            },
+            [pscustomobject]@{
+                Name = 'Attest release artifacts'
+                Key = 'subject-path'
+                Items = @('release/WingetUpdater-${{ github.ref_name }}.zip', 'release/SHA256SUMS')
+            },
+            [pscustomobject]@{
+                Name = 'Upload draft release assets'
+                Key = 'files'
+                Items = @('release/WingetUpdater-${{ github.ref_name }}.zip', 'release/SHA256SUMS')
+            }
+        )) {
+            $steps = @($releaseSteps | Where-Object {
+                $_.Value -match ('(?m)^ {6}-[ \t]*name:[ \t]*' + [regex]::Escape($expectation.Name) + '[ \t]*$')
+            })
+            $steps.Count | Should -Be 1
+            $withBlocks = @(& $getYamlBlocks $steps[0].Value 8 'with')
+            $withBlocks.Count | Should -Be 1
+            $inputBlocks = @(& $getYamlBlocks $withBlocks[0].Value 10 $expectation.Key)
+            $inputBlocks.Count | Should -Be 1
+            $items = @([regex]::Matches(
+                $inputBlocks[0].Value,
+                '(?m)^ {12}(?<value>\S[^\r\n]*?)[ \t]*$'
+            ) | ForEach-Object { $_.Groups['value'].Value.Trim() })
+            $items | Should -Be $expectation.Items
+        }
+    }
+
     It 'uploads all assets to a draft before publishing the immutable release' {
         $draftIndex = $releaseWorkflow.IndexOf('draft: true')
         $publishIndex = $releaseWorkflow.IndexOf('gh release edit')
 
         $draftIndex | Should -BeGreaterOrEqual 0
         $publishIndex | Should -BeGreaterThan $draftIndex
-        $releaseWorkflow | Should -Match 'gh\s+release\s+edit[^\r\n]+--draft=false[^\r\n]+--latest'
+        $releaseWorkflow | Should -Match 'gh\s+release\s+edit[^\r\n]+--draft=false[^\r\n]+"--latest=\$latestValue"'
         $releaseWorkflow | Should -Match 'GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}'
+    }
+
+    It 'publishes Latest only when no higher stable Semantic Version is already published' {
+        $releaseSteps = @(& $getWorkflowSteps $releaseWorkflow)
+        $publishSteps = @($releaseSteps | Where-Object {
+            $_.Value -match '(?m)^ {6}-[ \t]*name:[ \t]*Publish immutable GitHub Release[ \t]*$'
+        })
+        $publishSteps.Count | Should -Be 1
+        $runBlocks = @(& $getYamlBlocks $publishSteps[0].Value 8 'run')
+        $runBlocks.Count | Should -Be 1
+        $commandText = & $getRunCommandText $runBlocks[0]
+
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $commandText,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        @($parseErrors).Count | Should -Be 0
+        $commandLines = @($ast.FindAll({
+            param($node)
+
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true) | ForEach-Object { $_.Extent.Text.Trim() })
+
+        $releaseQueries = @($commandLines | Where-Object {
+            $_ -match '(?i)^gh(?:\.exe)?[ \t]+api\b' -and
+                $_ -match '--paginate\b' -and
+                $_ -match '--slurp\b' -and
+                $_ -match 'repos/\$env:REPOSITORY/releases\?per_page=100'
+        })
+        $releaseQueries.Count | Should -Be 1
+        $queryIndex = $commandText.IndexOf($releaseQueries[0])
+
+        $listExitAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$releaseListExitCode\s*=\s*\$LASTEXITCODE[ \t]*$'
+        )
+        $listExitAssignment.Success | Should -BeTrue
+        $listExitGuard = [regex]::Match(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$releaseListExitCode[ \t]+-ne[ \t]+0[ \t]*\)[ \t]*\{'
+        )
+        $listExitGuard.Success | Should -BeTrue
+        $releasePagesAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$releasePages\s*=\s*ConvertFrom-Json[ \t]+-InputObject[ \t]+\(\$releasePagesJson[ \t]+-join[ \t]+"`n"\)[ \t]+-ErrorAction[ \t]+Stop[ \t]*$'
+        )
+        $releasePagesAssignment.Success | Should -BeTrue
+        $listErrorBranch = $commandText.Substring(
+            $listExitGuard.Index,
+            $releasePagesAssignment.Index - $listExitGuard.Index
+        )
+        $listErrorBranch | Should -Match '(?mi)^[ \t]*throw\b'
+
+        $allReleasesAssignment = [regex]::Match(
+            $commandText,
+            '(?ms)^[ \t]*\$allReleases\s*=\s*@\([ \t]*\r?\n[ \t]+foreach[ \t]*\([ \t]*\$page[ \t]+in[ \t]+@\(\$releasePages\)[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+foreach[ \t]*\([ \t]*\$candidate[ \t]+in[ \t]+@\(\$page\)[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+\$candidate[ \t]*\r?\n[ \t]*\}[ \t]*\r?\n[ \t]*\}[ \t]*\r?\n[ \t]*\)[ \t]*$'
+        )
+        $allReleasesAssignment.Success | Should -BeTrue
+        $commandText | Should -Match '(?mi)^[ \t]*if[ \t]*\([ \t]*\$candidate\.draft[ \t]+-eq[ \t]+\$true[ \t]+-or[ \t]+\$candidate\.prerelease[ \t]+-eq[ \t]+\$true[ \t]*\)[ \t]*\{[ \t]*continue[ \t]*\}'
+        $stableTagGuards = [regex]::Matches(
+            $commandText,
+            '(?m)^[ \t]*if[ \t]*\([ \t]*\$candidateTag[ \t]+-notmatch[ \t]+''(?<pattern>[^'']+)''[ \t]*\)[ \t]*\{[ \t]*continue[ \t]*\}'
+        )
+        $stableTagGuards.Count | Should -Be 1
+        $stableTagGuards[0].Groups['pattern'].Value | Should -Be '^v([0-9]+)\.([0-9]+)\.([0-9]+)$'
+        $commandText | Should -Match '(?m)^[ \t]*\$currentVersion\s*=\s*\[version\]'
+        $commandText | Should -Match '(?m)^[ \t]*\$candidateVersion\s*=\s*\[version\]'
+        $higherVersionGuard = [regex]::Match(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$candidateVersion[ \t]+-gt[ \t]+\$currentVersion[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+\$hasHigherStableRelease\s*=\s*\$true'
+        )
+        $higherVersionGuard.Success | Should -BeTrue
+        $latestAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$latestValue\s*=\s*if[ \t]*\([ \t]*\$hasHigherStableRelease[ \t]*\)[ \t]*\{[ \t]*''false''[ \t]*\}[ \t]*else[ \t]*\{[ \t]*''true''[ \t]*\}[ \t]*$'
+        )
+        $latestAssignment.Success | Should -BeTrue
+
+        $editCommands = @($commandLines | Where-Object {
+            $_ -match '(?i)^gh(?:\.exe)?[ \t]+release[ \t]+edit\b'
+        })
+        $editCommands.Count | Should -Be 1
+        $editCommands[0] | Should -Match '\$env:RELEASE_TAG\b'
+        $editCommands[0] | Should -Match '--repo[ \t]+\$env:REPOSITORY\b'
+        $editCommands[0] | Should -Match '--draft=false\b'
+        $editCommands[0] | Should -Match '"--latest=\$latestValue"'
+        $editIndex = $commandText.IndexOf($editCommands[0])
+        $editExitAssignment = [regex]::Match(
+            $commandText,
+            '(?m)^[ \t]*\$editExitCode\s*=\s*\$LASTEXITCODE[ \t]*$'
+        )
+        $editExitAssignment.Success | Should -BeTrue
+        $editExitGuard = [regex]::Match(
+            $commandText,
+            '(?mi)^[ \t]*if[ \t]*\([ \t]*\$editExitCode[ \t]+-ne[ \t]+0[ \t]*\)[ \t]*\{[ \t]*\r?\n[ \t]+throw\b[^\r\n]*\r?\n[ \t]*\}'
+        )
+        $editExitGuard.Success | Should -BeTrue
+
+        $queryIndex | Should -BeLessThan $listExitAssignment.Index
+        $listExitAssignment.Index | Should -BeLessThan $listExitGuard.Index
+        $listExitGuard.Index | Should -BeLessThan $releasePagesAssignment.Index
+        $releasePagesAssignment.Index | Should -BeLessThan $allReleasesAssignment.Index
+        $allReleasesAssignment.Index | Should -BeLessThan $higherVersionGuard.Index
+        $higherVersionGuard.Index | Should -BeLessThan $latestAssignment.Index
+        $latestAssignment.Index | Should -BeLessThan $editIndex
+        $editIndex | Should -BeLessThan $editExitAssignment.Index
+        $editExitAssignment.Index | Should -BeLessThan $editExitGuard.Index
     }
 
     It 'inspects release state before mutating immutable publication' {
@@ -1845,6 +1991,12 @@ Describe 'Release Package Manifest' {
         )
         $releaseGroups.Count | Should -Be 1
         $releaseGroups[0].Groups['value'].Value.Trim() | Should -Be 'release-publication'
+        $releaseQueues = [regex]::Matches(
+            $releaseConcurrencyBlocks[0].Value,
+            '(?m)^  queue[ \t]*:[ \t]*(?<value>[^#\r\n]*?)(?:[ \t]*#.*)?$'
+        )
+        $releaseQueues.Count | Should -Be 1
+        $releaseQueues[0].Groups['value'].Value.Trim() | Should -Be 'max'
 
         $ciJobsBlocks = @(& $getYamlBlocks $ciWorkflow 0 'jobs')
         $ciJobsBlocks.Count | Should -Be 1
