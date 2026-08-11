@@ -8,10 +8,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-publication
+  queue: max
+  cancel-in-progress: false
+
 jobs:
   validate:
     name: Validate (${{ matrix.shell }})
     runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -22,9 +28,10 @@ jobs:
 
     steps:
       - name: Checkout tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pinned PowerShell modules
         run: |
@@ -54,19 +61,23 @@ jobs:
     name: Validate tag and package release
     needs: validate
     runs-on: windows-latest
+    timeout-minutes: 10
     permissions:
       contents: read
 
     steps:
       - name: Checkout tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify annotated tag and version consistency
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           if ($tag -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
               throw "Release tag is not strict Semantic Versioning: $tag"
           }
@@ -101,8 +112,10 @@ jobs:
 
       - name: Build and verify release archive
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           $zipName = "WingetUpdater-$tag.zip"
 
           $files = @(
@@ -169,11 +182,11 @@ jobs:
           [System.IO.File]::WriteAllText('SHA256SUMS', "$hash  $zipName`n", (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Upload validated release bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-bundle
           path: |
-            WingetUpdater-*.zip
+            WingetUpdater-${{ github.ref_name }}.zip
             SHA256SUMS
           if-no-files-found: error
           retention-days: 7
@@ -182,14 +195,16 @@ jobs:
     name: Attest and publish release
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
 
     steps:
       - name: Download validated release bundle
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-bundle
           path: release
@@ -204,26 +219,216 @@ jobs:
           $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $parts[0]) { throw 'Downloaded release bundle checksum mismatch.' }
 
-      - name: Attest release artifacts
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        with:
-          subject-path: |
-            release/WingetUpdater-*.zip
-            release/SHA256SUMS
-
-      - name: Upload draft release assets
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
-            release/WingetUpdater-*.zip
-            release/SHA256SUMS
-          draft: true
-          prerelease: false
-          generate_release_notes: true
-
-      - name: Publish immutable GitHub Release
+      - name: Inspect existing release
+        id: release-state
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          gh release edit '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft=false --latest
+          $expectedZip = "WingetUpdater-$env:RELEASE_TAG.zip"
+          $release = $null
+          $apiErrorPath = Join-Path $env:RUNNER_TEMP "release-api-$([guid]::NewGuid().ToString('N')).txt"
+          $releaseJson = gh api "repos/$env:REPOSITORY/releases/tags/$env:RELEASE_TAG" 2> $apiErrorPath
+          $apiExitCode = $LASTEXITCODE
+
+          if ($apiExitCode -eq 0) {
+              $release = ConvertFrom-Json -InputObject ($releaseJson -join "`n") -ErrorAction Stop
+          }
+          else {
+              $apiError = if (Test-Path -LiteralPath $apiErrorPath) {
+                  [System.IO.File]::ReadAllText($apiErrorPath)
+              }
+              else {
+                  ''
+              }
+              if ($apiError -notmatch '(?i)Not Found' -or $apiError -notmatch '(?i)HTTP 404') {
+                  throw "Unable to inspect release '$env:RELEASE_TAG': $apiError"
+              }
+
+              # The tag endpoint exposes only published releases, so scan authenticated listings for drafts.
+              $listErrorPath = Join-Path $env:RUNNER_TEMP "release-list-$([guid]::NewGuid().ToString('N')).txt"
+              $releasePagesJson = gh api --paginate --slurp "repos/$env:REPOSITORY/releases?per_page=100" 2> $listErrorPath
+              if ($LASTEXITCODE -ne 0) {
+                  $listError = if (Test-Path -LiteralPath $listErrorPath) {
+                      [System.IO.File]::ReadAllText($listErrorPath)
+                  }
+                  else {
+                      ''
+                  }
+                  throw "Unable to inspect draft releases: $listError"
+              }
+
+              $releasePages = ConvertFrom-Json -InputObject ($releasePagesJson -join "`n") -ErrorAction Stop
+              $matchingReleases = @(
+                  foreach ($page in @($releasePages)) {
+                      foreach ($candidate in @($page)) {
+                          if ($candidate.tag_name -ceq $env:RELEASE_TAG) {
+                              $candidate
+                          }
+                      }
+                  }
+              )
+              $release = $matchingReleases |
+                  Sort-Object @{ Expression = { [int]$_.draft } }, id |
+                  Select-Object -First 1
+          }
+
+          $expectedNames = @('SHA256SUMS', $expectedZip) | Sort-Object
+          if ($null -eq $release) {
+              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=missing'
+              return
+          }
+          if ($release.draft -eq $true) {
+              $draftAssetErrorPath = Join-Path $env:RUNNER_TEMP "draft-assets-$([guid]::NewGuid().ToString('N')).txt"
+              $draftAssetPagesJson = gh api --paginate --slurp "repos/$env:REPOSITORY/releases/$($release.id)/assets?per_page=100" 2> $draftAssetErrorPath
+              $draftAssetExitCode = $LASTEXITCODE
+              if ($draftAssetExitCode -ne 0) {
+                  $draftAssetError = if (Test-Path -LiteralPath $draftAssetErrorPath) {
+                      [System.IO.File]::ReadAllText($draftAssetErrorPath)
+                  }
+                  else {
+                      ''
+                  }
+                  throw "Unable to inspect draft release assets: $draftAssetError"
+              }
+
+              $draftAssetPages = ConvertFrom-Json -InputObject ($draftAssetPagesJson -join "`n") -ErrorAction Stop
+              $draftAssets = @(
+                  foreach ($page in @($draftAssetPages)) {
+                      foreach ($asset in @($page)) {
+                          $asset
+                      }
+                  }
+              )
+              $draftAssetNames = @($draftAssets | ForEach-Object name | Sort-Object)
+              $unexpectedDraftAssets = @($draftAssetNames | Where-Object { $_ -cnotin $expectedNames })
+              if ($unexpectedDraftAssets.Count -gt 0) {
+                  throw "Draft release has unexpected assets: $($unexpectedDraftAssets -join ', ')"
+              }
+              Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=draft'
+              return
+          }
+
+          $releaseAssetNames = @($release.assets | ForEach-Object name | Sort-Object)
+          if (@(Compare-Object -ReferenceObject $expectedNames -DifferenceObject $releaseAssetNames).Count -ne 0) {
+              throw "Published release has unexpected assets: $($releaseAssetNames -join ', ')"
+          }
+
+          $verificationDirectory = Join-Path $env:RUNNER_TEMP "published-release-$([guid]::NewGuid().ToString('N'))"
+          [void](New-Item -ItemType Directory -Path $verificationDirectory)
+          gh release download $env:RELEASE_TAG --repo $env:REPOSITORY --dir $verificationDirectory --clobber --pattern 'SHA256SUMS' --pattern $expectedZip
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Unable to download published release assets for verification.'
+          }
+
+          $downloadedNames = @(Get-ChildItem -LiteralPath $verificationDirectory -File | ForEach-Object Name | Sort-Object)
+          if (@(Compare-Object -ReferenceObject $expectedNames -DifferenceObject $downloadedNames).Count -ne 0) {
+              throw "Downloaded release has unexpected assets: $($downloadedNames -join ', ')"
+          }
+
+          $checksumPath = Join-Path $verificationDirectory 'SHA256SUMS'
+          $checksumText = [System.IO.File]::ReadAllText($checksumPath)
+          $checksumMatch = [regex]::Match($checksumText, '\A(?<hash>[0-9a-fA-F]{64})  (?<filename>[^\r\n]+)\r?\n?\z')
+          if (-not $checksumMatch.Success) {
+              throw 'Published SHA256SUMS has an invalid format.'
+          }
+          if ($checksumMatch.Groups['filename'].Value -cne $expectedZip) {
+              throw 'Published SHA256SUMS names an unexpected archive.'
+          }
+
+          $publishedZipPath = Join-Path $verificationDirectory $expectedZip
+          $expectedHash = $checksumMatch.Groups['hash'].Value.ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $publishedZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+              throw 'Published release archive checksum mismatch.'
+          }
+
+          $currentZipPath = Join-Path release $expectedZip
+          $currentZipHash = (Get-FileHash -LiteralPath $currentZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $currentZipHash) {
+              throw 'Published release archive does not match the current validated bundle.'
+          }
+
+          $currentChecksumPath = Join-Path release 'SHA256SUMS'
+          $currentChecksumHash = (Get-FileHash -LiteralPath $currentChecksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $publishedChecksumHash = (Get-FileHash -LiteralPath $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($publishedChecksumHash -ne $currentChecksumHash) {
+              throw 'Published SHA256SUMS does not match the current validated bundle.'
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'state=published'
+
+      - name: Attest release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release/WingetUpdater-${{ github.ref_name }}.zip
+            release/SHA256SUMS
+
+      - name: Upload draft release assets
+        if: steps.release-state.outputs.state != 'published'
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            release/WingetUpdater-${{ github.ref_name }}.zip
+            release/SHA256SUMS
+          draft: true
+          prerelease: false
+          generate_release_notes: ${{ steps.release-state.outputs.state == 'missing' }}
+          fail_on_unmatched_files: true
+
+      - name: Publish immutable GitHub Release
+        if: steps.release-state.outputs.state != 'published'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+              throw "Release tag is not strict Semantic Versioning: $env:RELEASE_TAG"
+          }
+          $currentVersion = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+
+          $releaseListErrorPath = Join-Path $env:RUNNER_TEMP "published-releases-$([guid]::NewGuid().ToString('N')).txt"
+          $releasePagesJson = gh api --paginate --slurp "repos/$env:REPOSITORY/releases?per_page=100" 2> $releaseListErrorPath
+          $releaseListExitCode = $LASTEXITCODE
+          if ($releaseListExitCode -ne 0) {
+              $releaseListError = if (Test-Path -LiteralPath $releaseListErrorPath) {
+                  [System.IO.File]::ReadAllText($releaseListErrorPath)
+              }
+              else {
+                  ''
+              }
+              throw "Unable to inspect published releases: $releaseListError"
+          }
+
+          $releasePages = ConvertFrom-Json -InputObject ($releasePagesJson -join "`n") -ErrorAction Stop
+          $allReleases = @(
+              foreach ($page in @($releasePages)) {
+                  foreach ($candidate in @($page)) {
+                      $candidate
+                  }
+              }
+          )
+
+          $hasHigherStableRelease = $false
+          foreach ($candidate in $allReleases) {
+              if ($candidate.draft -eq $true -or $candidate.prerelease -eq $true) { continue }
+              $candidateTag = [string]$candidate.tag_name
+              if ($candidateTag -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') { continue }
+              $candidateVersion = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+              if ($candidateVersion -gt $currentVersion) {
+                  $hasHigherStableRelease = $true
+                  break
+              }
+          }
+
+          $latestValue = if ($hasHigherStableRelease) { 'false' } else { 'true' }
+          gh release edit $env:RELEASE_TAG --repo $env:REPOSITORY --draft=false "--latest=$latestValue"
+          $editExitCode = $LASTEXITCODE
+          if ($editExitCode -ne 0) {
+              throw "Unable to publish release '$env:RELEASE_TAG'."
+          }

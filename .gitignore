@@ -15,6 +15,7 @@ repair-contexts/
 .license-accepted
 .kilo/
 .worktrees/
+/docs/
 .playwright-mcp/
 session-ses_*.md
 

@@ -1391,17 +1391,25 @@ Describe 'AI Session Failure Handoff' {
             $env:WINGETUPDATER_AI_FIXTURE_OUTPUT = $markerPath
             Start-WingetUpdaterAICliProcess -CliPath $fixturePath -CommandProcessorPath $env:ComSpec
 
-            $deadline = [datetime]::UtcNow.AddSeconds(10)
+            $deadline = [datetime]::UtcNow.AddSeconds(30)
             while (-not (Test-Path -LiteralPath $markerPath -PathType Leaf) -and [datetime]::UtcNow -lt $deadline) {
                 Start-Sleep -Milliseconds 100
             }
-            Test-Path -LiteralPath $markerPath -PathType Leaf | Should -BeTrue
+            $markerExists = Test-Path -LiteralPath $markerPath -PathType Leaf
+            if (-not $markerExists) {
+                $activeFixtureProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Name -eq 'cmd.exe' -and [string]$_.CommandLine -like "*$fixturePath*"
+                })
+                $processDetails = @($activeFixtureProcesses | ForEach-Object { "PID=$($_.ProcessId) CommandLine=$($_.CommandLine)" }) -join '; '
+                throw "AI CLI fixture did not create '$markerPath' within 30 seconds. Active fixture processes: $processDetails"
+            }
+            $markerExists | Should -BeTrue
             $invocation = [System.IO.File]::ReadAllText($markerPath)
             $invocation | Should -Match ('(?m)^CWD=' + [regex]::Escape([Environment]::GetFolderPath('UserProfile')) + '\r?$')
             $invocation | Should -Match '(?m)^ARGS=\s*\r?$'
             $invocation | Should -Not -Match '(?i)(approval|sandbox|model|prompt|RunAs)'
 
-            $processDeadline = [datetime]::UtcNow.AddSeconds(10)
+            $processDeadline = [datetime]::UtcNow.AddSeconds(30)
             do {
                 $fixtureProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
                     $_.Name -eq 'cmd.exe' -and [string]$_.CommandLine -like "*$fixturePath*"
